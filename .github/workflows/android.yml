@@ -29,9 +29,8 @@ jobs:
 
       - name: Patch for ARM64 Cross-Compilation
         run: |
-          # 1. Download sse2neon using curl with fallback branches
-          curl -sSL -f https://raw.githubusercontent.com/DLu/sse2neon/master/sse2neon.h -o src/sse2neon.h || \
-          curl -sSL -f https://raw.githubusercontent.com/DLu/sse2neon/main/sse2neon.h -o src/sse2neon.h
+          # 1. Download sse2neon from the correct repo (DLTcollab/sse2neon)
+          curl -sSL -f https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o src/sse2neon.h
 
           # 2. Replace x86 header inclusions with sse2neon on ARM targets
           find src/ -type f \( -name "*.h" -o -name "*.cpp" \) -exec sed -i \
