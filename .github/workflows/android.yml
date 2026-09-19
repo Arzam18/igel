@@ -1,0 +1,70 @@
+name: Build Igel for Android
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            arch_flag: ""
+          - abi: armeabi-v7a
+            arch_flag: ""
+          - abi: x86_64
+            arch_flag: "-DUSE_AVX2=ON"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK
+        uses: nkmr-ki/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build wget
+
+      - name: Fetch NNUE Weights
+        run: |
+          mkdir -p weights
+          # Download standard NNUE weight file if present in CMake setup
+          wget -q https://raw.githubusercontent.com/vslavov/igel/master/weights/6b953e78.standard -O weights/6b953e78.standard || true
+
+      - name: Configure CMake
+        run: |
+          cmake -B build_${{ matrix.abi }} \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK_PATH }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.arch_flag }}
+
+      - name: Build Binary
+        run: |
+          cmake --build build_${{ matrix.abi }} --config Release
+
+      - name: Prepare Artifact
+        run: |
+          mkdir -p output
+          cp build_${{ matrix.abi }}/igel* output/igel-android-${{ matrix.abi }} || true
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: igel-android-${{ matrix.abi }}
+          path: output/
