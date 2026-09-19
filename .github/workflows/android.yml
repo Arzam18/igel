@@ -20,7 +20,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build wget
+          sudo apt-get install -y ninja-build wget curl
 
       - name: Fetch NNUE Weights
         run: |
@@ -29,8 +29,9 @@ jobs:
 
       - name: Patch for ARM64 Cross-Compilation
         run: |
-          # 1. Download sse2neon to translate x86 SSE/AVX intrinsics to ARM NEON
-          wget -q https://raw.githubusercontent.com/DLu/sse2neon/master/sse2neon.h -O src/sse2neon.h
+          # 1. Download sse2neon using curl with fallback branches
+          curl -sSL -f https://raw.githubusercontent.com/DLu/sse2neon/master/sse2neon.h -o src/sse2neon.h || \
+          curl -sSL -f https://raw.githubusercontent.com/DLu/sse2neon/main/sse2neon.h -o src/sse2neon.h
 
           # 2. Replace x86 header inclusions with sse2neon on ARM targets
           find src/ -type f \( -name "*.h" -o -name "*.cpp" \) -exec sed -i \
