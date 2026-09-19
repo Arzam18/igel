@@ -30,7 +30,9 @@
 
 int main(int argc, const char* argv[])
 {
+#if defined(USE_AVX2)
     static_assert(USE_AVX2 == 1, "AVX2 is the minimum supported build type");
+#endif
 
     //
     //  initialize igel
