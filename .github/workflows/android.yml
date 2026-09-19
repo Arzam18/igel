@@ -17,11 +17,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Android NDK
-        uses: nkmr-ki/setup-ndk@v1
-        with:
-          ndk-version: r26b
-
       - name: Install Ninja
         run: |
           sudo apt-get update
@@ -36,7 +31,7 @@ jobs:
         run: |
           cmake -B build_arm64 \
             -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK_PATH }}/build/cmake/android.toolchain.cmake \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-24 \
             -DCMAKE_BUILD_TYPE=Release
