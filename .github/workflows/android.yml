@@ -17,7 +17,7 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Ninja
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build wget
@@ -27,11 +27,22 @@ jobs:
           mkdir -p weights
           wget -q https://raw.githubusercontent.com/vslavov/igel/master/weights/6b953e78.standard -O weights/6b953e78.standard || true
 
-      - name: Patch CMakeLists.txt for Android Cross-Compilation
+      - name: Patch for ARM64 Cross-Compilation
         run: |
-          # Remove x86/host-specific compiler flags from CMakeLists.txt
+          # 1. Download sse2neon to translate x86 SSE/AVX intrinsics to ARM NEON
+          wget -q https://raw.githubusercontent.com/DLu/sse2neon/master/sse2neon.h -O src/sse2neon.h
+
+          # 2. Replace x86 header inclusions with sse2neon on ARM targets
+          find src/ -type f \( -name "*.h" -o -name "*.cpp" \) -exec sed -i \
+            's/#include <immintrin.h>/#if defined(__aarch64__) || defined(__arm__)\n#include "sse2neon.h"\n#else\n#include <immintrin.h>\n#endif/g' {} +
+
+          find src/ -type f \( -name "*.h" -o -name "*.cpp" \) -exec sed -i \
+            's/#include <x86intrin.h>/#if defined(__aarch64__) || defined(__arm__)\n#include "sse2neon.h"\n#else\n#include <x86intrin.h>\n#endif/g' {} +
+
+          # 3. Strip x86-specific compiler flags from CMakeLists.txt
           sed -i 's/-march=native//g' CMakeLists.txt
           sed -i 's/-mavx2//g' CMakeLists.txt
+          sed -i 's/-msse[^ ]*//g' CMakeLists.txt
           sed -i -E 's/-fuse-ld=[^ ]*//g' CMakeLists.txt
 
       - name: Configure CMake
