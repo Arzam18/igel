@@ -21,7 +21,9 @@
 #include "position.h"
 #include "hce.h"
 #include "utils.h"
+#if defined(USE_AVX512) || defined(USE_AVX2)
 #include <immintrin.h>
+#endif
 #include <algorithm>
 #include <new>
 #include <cstdlib>
@@ -331,15 +333,31 @@ static inline void applyThreats(const Transformer & t, std::int16_t * accumulati
         psqtAcc = _mm256_add_epi32(psqtAcc, _mm256_load_si256(reinterpret_cast<const __m256i*>(t.threatPsqts(added[i]))));
 
     _mm256_store_si256(reinterpret_cast<__m256i*>(psqt), psqtAcc);
+#else
+    for (size_t i = 0; i < removed.size(); ++i) {
+        const std::int8_t* col = t.threatWeights(removed[i]);
+        for (std::uint32_t j = 0; j < Transformer::HalfDimensions; ++j)
+            accumulation[j] -= col[j];
+        for (size_t k = 0; k < PSQT_BUCKETS; ++k)
+            psqt[k] -= t.threatPsqts(removed[i])[k];
+    }
+
+    for (size_t i = 0; i < added.size(); ++i) {
+        const std::int8_t* col = t.threatWeights(added[i]);
+        for (std::uint32_t j = 0; j < Transformer::HalfDimensions; ++j)
+            accumulation[j] += col[j];
+        for (size_t k = 0; k < PSQT_BUCKETS; ++k)
+            psqt[k] += t.threatPsqts(added[i])[k];
+    }
 #endif
 }
 
+#if defined(USE_AVX2)
 inline __m256i vec_msb_pack_16(__m256i a, __m256i b) {
     __m256i compacted = _mm256_packs_epi16(_mm256_srli_epi16(a, 7), _mm256_srli_epi16(b, 7));
     return _mm256_permute4x64_epi64(compacted, 0b11011000);
 }
 
-#if defined(USE_AVX2)
 inline __m256i affine_acc_256(__m256i acc, __m256i a, __m256i b) {
 #if defined(USE_AVXVNNI)
     return _mm256_dpbusd_epi32(acc, a, b);
@@ -367,6 +385,7 @@ inline __m512i affine_acc_512(__m512i acc, __m512i a, __m512i b) {
 }
 #endif
 
+#if defined(USE_AVX2) || defined(USE_AVX512)
 inline __m128i m256_haddx4(__m256i s0, __m256i s1, __m256i s2, __m256i s3, __m128i bias) {
     s0 = _mm256_hadd_epi32(s0, s1);
     s2 = _mm256_hadd_epi32(s2, s3);
@@ -375,6 +394,7 @@ inline __m128i m256_haddx4(__m256i s0, __m256i s1, __m256i s2, __m256i s3, __m12
     const __m128i hi = _mm256_extracti128_si256(s0, 1);
     return _mm_add_epi32(_mm_add_epi32(lo, hi), bias);
 }
+#endif
 
 #if defined(USE_AVX512)
 inline __m128i m512_haddx4(__m512i s0, __m512i s1, __m512i s2, __m512i s3, __m128i bias) {
@@ -459,6 +479,17 @@ std::int32_t Transformer::transform(Position & pos, std::uint8_t * outBuffer, co
             const __m256i pb = _mm256_mullo_epi16(sum0b, sum1b);
 
             out[j] = vec_msb_pack_16(pa, pb);
+        }
+#else
+        const auto* in0 = &(acc[sides[side]][0]);
+        const auto* in1 = &(acc[sides[side]][HalfDimensions / 2]);
+        auto* out = outBuffer + offset;
+
+        for (std::uint32_t j = 0; j < HalfDimensions / 2; ++j) {
+            std::int16_t v0 = std::max<std::int16_t>(0, std::min<std::int16_t>(127, in0[j]));
+            std::int16_t v1 = std::max<std::int16_t>(0, std::min<std::int16_t>(127, in1[j]));
+            std::int16_t prod = v0 * v1;
+            out[j] = static_cast<std::uint8_t>(std::min(127, prod >> 7));
         }
 #endif
     }
@@ -587,13 +618,21 @@ static void refreshPerspective(Transformer & t, Position & pos, COLOR c) {
             cacheAcc[j] = vadd16(cacheAcc[j], column[j]);
     }
 #else
-    for (std::uint32_t index = 0; index < cr; index++)
+    for (std::uint32_t index = 0; index < cr; index++) {
+        std::uint32_t offset = Transformer::HalfDimensions * removed[index];
         for (std::size_t k = 0; k < PSQT_BUCKETS; ++k)
             entry.psqt[k] -= t.psqts[removed[index] * PSQT_BUCKETS + k];
+        for (std::size_t j = 0; j < Transformer::HalfDimensions; ++j)
+            entry.accumulation[j] -= t.weights[offset + j];
+    }
 
-    for (std::uint32_t index = 0; index < ca; index++)
+    for (std::uint32_t index = 0; index < ca; index++) {
+        std::uint32_t offset = Transformer::HalfDimensions * added[index];
         for (std::size_t k = 0; k < PSQT_BUCKETS; ++k)
             entry.psqt[k] += t.psqts[added[index] * PSQT_BUCKETS + k];
+        for (std::size_t j = 0; j < Transformer::HalfDimensions; ++j)
+            entry.accumulation[j] += t.weights[offset + j];
+    }
 #endif
 
     std::memcpy(accumulator.accumulation[c], entry.accumulation, Transformer::HalfDimensions * sizeof(std::int16_t));
@@ -717,6 +756,9 @@ inline void Transformer::incremental(Position & pos, const Accumulator * baseAcc
                 auto column = reinterpret_cast<const acc_vec_t*>(&weights[offset]);
                 for (std::uint32_t j = 0; j < chunks; ++j)
                     accumulation[j] = vsub16(accumulation[j], column[j]);
+#else
+                for (std::uint32_t j = 0; j < HalfDimensions; ++j)
+                    accumulator.accumulation[c][j] -= weights[offset + j];
 #endif
             }
 
@@ -737,6 +779,9 @@ inline void Transformer::incremental(Position & pos, const Accumulator * baseAcc
                 auto column = reinterpret_cast<const acc_vec_t*>(&weights[offset]);
                 for (std::uint32_t j = 0; j < chunks; ++j)
                     accumulation[j] = vadd16(accumulation[j], column[j]);
+#else
+                for (std::uint32_t j = 0; j < HalfDimensions; ++j)
+                    accumulator.accumulation[c][j] += weights[offset + j];
 #endif
             }
 #if defined(USE_AVX2)
@@ -814,9 +859,6 @@ inline std::int32_t * Layer<OutputDimensions, InputDimensions>::propagate(std::u
 
 #if defined(USE_AVX2)
     // 4-way kernel blocking: process 4 output neurons simultaneously.
-    // 4 independent accumulator chains allow better ILP vs. one serial chain per output.
-    // Threshold is one full SIMD chunk so the small 32x32 hidden layer also takes this path,
-    // where batching the four reductions is a bigger win than the dot-product itself.
     if constexpr (OutputDimensions % 4 == 0 && InputDimensions >= 32) {
         for (std::uint32_t i = 0; i < OutputDimensions; i += 4) {
             __m256i s0 = _mm256_setzero_si256();
@@ -854,6 +896,12 @@ inline std::int32_t * Layer<OutputDimensions, InputDimensions>::propagate(std::u
         sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_PERM_BADC));
         sum128 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, _MM_PERM_CDAB));
         output[i] = _mm_cvtsi128_si32(sum128) + biases[i];
+#else
+        std::int32_t sum = 0;
+        for (std::uint32_t j = 0; j < InputDimensions; ++j) {
+            sum += static_cast<std::int32_t>(features[j]) * weights[offset + j];
+        }
+        output[i] = sum + biases[i];
 #endif
     }
 
@@ -886,6 +934,7 @@ template <std::int32_t WeightScaleBits, std::int32_t InputDimensions>
 inline std::uint8_t* ClippedReLU<WeightScaleBits, InputDimensions>::propagate(std::int32_t* features, char* outBuffer) {
 
     auto output = reinterpret_cast<uint8_t*>(outBuffer);
+    std::uint32_t start = 0;
 
 #if defined(USE_AVX2)
     auto chunks = InputDimensions / SIMD_WIDTH;
@@ -899,9 +948,8 @@ inline std::uint8_t* ClippedReLU<WeightScaleBits, InputDimensions>::propagate(st
         const __m256i words1 = _mm256_srai_epi16(_mm256_packs_epi32(_mm256_loadA_si256(&in[i * 4 + 2]), _mm256_loadA_si256(&in[i * 4 + 3])), WeightScaleBits);
         _mm256_storeA_si256(&out[i], _mm256_permutevar8x32_epi32(_mm256_max_epi8(_mm256_packs_epi16(words0, words1), zero), offsets));
     }
+    start = chunks * SIMD_WIDTH;
 #endif
-
-    std::uint32_t start = chunks * SIMD_WIDTH;
 
     for (std::uint32_t i = start; i < InputDimensions; ++i)
         output[i] = static_cast<std::uint8_t>(std::max(0, std::min(127, features[i] >> WeightScaleBits)));
