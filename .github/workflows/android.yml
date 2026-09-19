@@ -27,6 +27,13 @@ jobs:
           mkdir -p weights
           wget -q https://raw.githubusercontent.com/vslavov/igel/master/weights/6b953e78.standard -O weights/6b953e78.standard || true
 
+      - name: Patch CMakeLists.txt for Android Cross-Compilation
+        run: |
+          # Remove x86/host-specific compiler flags from CMakeLists.txt
+          sed -i 's/-march=native//g' CMakeLists.txt
+          sed -i 's/-mavx2//g' CMakeLists.txt
+          sed -i -E 's/-fuse-ld=[^ ]*//g' CMakeLists.txt
+
       - name: Configure CMake
         run: |
           cmake -B build_arm64 \
