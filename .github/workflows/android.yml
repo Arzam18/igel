@@ -62,10 +62,6 @@ jobs:
           echo "$ANDROID_NDK"
 
           echo
-          echo "Android CMake toolchain:"
-          echo "$ANDROID_NDK/build/cmake/android.toolchain.cmake"
-
-          echo
           echo "C compiler:"
           "$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang" \
             --version
@@ -85,36 +81,21 @@ jobs:
           CC="$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang"
           CXX="$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang++"
 
-          echo "CC=$CC"
-          echo "CXX=$CXX"
-
           CC_TARGET="$("$CC" -dumpmachine)"
           CXX_TARGET="$("$CXX" -dumpmachine)"
 
           echo "C target:   $CC_TARGET"
           echo "C++ target: $CXX_TARGET"
 
-          # NDK 27 reports:
-          # aarch64-unknown-linux-android24
-          #
-          # Older NDKs may report:
-          # aarch64-linux-android
-          #
-          # Both are valid Android AArch64 targets.
-
           if ! echo "$CC_TARGET" \
               | grep -Eq '^aarch64-(unknown-)?linux-android'; then
-
-            echo "ERROR: C compiler is not targeting Android AArch64."
-            echo "Actual target: $CC_TARGET"
+            echo "ERROR: C compiler is not Android AArch64."
             exit 1
           fi
 
           if ! echo "$CXX_TARGET" \
               | grep -Eq '^aarch64-(unknown-)?linux-android'; then
-
-            echo "ERROR: C++ compiler is not targeting Android AArch64."
-            echo "Actual target: $CXX_TARGET"
+            echo "ERROR: C++ compiler is not Android AArch64."
             exit 1
           fi
 
@@ -156,18 +137,6 @@ jobs:
           #endif
           """
 
-          new = """#if defined(_WIN32)
-              void * raw = _aligned_alloc(bytes, HugePage);
-          #elif defined(__ANDROID__)
-              void * raw = nullptr;
-              if (posix_memalign(&raw, HugePage, bytes) != 0)
-                  raw = nullptr;
-          #else
-              void * raw = std::aligned_alloc(HugePage, bytes);
-          #endif
-          """
-
-          # Correct Windows branch if needed.
           new = """#if defined(_WIN32)
               void * raw = _aligned_malloc(bytes, HugePage);
           #elif defined(__ANDROID__)
@@ -229,7 +198,14 @@ jobs:
             -DCMAKE_CXX_FLAGS="-march=armv8-a+simd -O3 -fno-exceptions -fno-rtti"
 
           echo
-          echo "===== CMake Android configuration ====="
+          echo "===== CMake target ====="
+
+          grep -n \
+            "ADD_EXECUTABLE" \
+            CMakeLists.txt
+
+          echo
+          echo "===== CMake configuration ====="
 
           cmake \
             -LAH \
@@ -239,24 +215,12 @@ jobs:
               'CMAKE_(C|CXX)_COMPILER|CMAKE_SYSTEM_NAME|CMAKE_SYSTEM_PROCESSOR|CMAKE_ANDROID_ARCH_ABI|ANDROID_ABI|ANDROID_PLATFORM' \
               || true
 
-      - name: Verify configured compiler
+      - name: Verify CMake Android configuration
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "===== CMake compiler configuration ====="
-
-          find build-android/CMakeFiles \
-            -type f \
-            \( \
-              -name "CMakeCCompiler.cmake" \
-              -o \
-              -name "CMakeCXXCompiler.cmake" \
-            \) \
-            -print
-
-          echo
-          echo "===== Searching for Android AArch64 compiler ====="
+          echo "===== Searching CMake compiler configuration ====="
 
           if grep -R \
               -E \
@@ -264,25 +228,14 @@ jobs:
               build-android/CMakeFiles \
               >/dev/null 2>&1; then
 
-            echo "SUCCESS: CMake contains Android AArch64 compiler configuration."
+            echo "SUCCESS: CMake is configured for Android AArch64."
 
           else
 
-            echo "ERROR: CMake does not contain Android AArch64 compiler configuration."
+            echo "ERROR: Android AArch64 compiler was not found in CMake configuration."
             exit 1
 
           fi
-
-          echo
-          echo "===== Searching CMake system information ====="
-
-          grep -R \
-            -E \
-            'CMAKE_SYSTEM_NAME|Android|aarch64|arm64-v8a' \
-            build-android/CMakeFiles \
-            2>/dev/null \
-            | head -100 \
-            || true
 
       - name: Build Igel
         shell: bash
@@ -290,40 +243,60 @@ jobs:
           set -euxo pipefail
 
           cmake --build build-android \
+            --target igel \
             --parallel "$(nproc)" \
             --verbose
 
-      - name: Locate engine
+      - name: Verify actual Igel target exists
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "===== Built executable files ====="
+          echo "===== Expected target ====="
 
-          find build-android \
-            -type f \
-            -perm -111 \
-            -print
+          ls -lah build-android/igel
 
-          BINARY="$(
-            find build-android \
-              -type f \
-              -perm -111 \
-              ! -name '*.so' \
-              ! -name '*.a' \
-              | head -1
-          )"
+          test -f build-android/igel
+          test -x build-android/igel
 
-          if [ -z "$BINARY" ]; then
-            echo "ERROR: Could not find Igel executable."
+          echo
+          echo "===== Actual Igel target ====="
+
+          file build-android/igel
+
+          echo
+          echo "===== Size ====="
+
+          stat -c '%n %s bytes' build-android/igel
+
+          SIZE="$(stat -c '%s' build-android/igel)"
+
+          # Igel contains a large embedded NNUE network.
+          # A few-KB executable means we selected the wrong file.
+          if [ "$SIZE" -lt 100000 ]; then
+            echo "ERROR: Igel executable is suspiciously small:"
+            echo "$SIZE bytes"
             exit 1
           fi
 
-          echo "Selected binary:"
-          echo "$BINARY"
+          echo "SUCCESS: Igel target has a plausible size."
 
-          cp "$BINARY" Igel-android-arm64-neon
+      - name: Package actual Igel binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp build-android/igel \
+            Igel-android-arm64-neon
+
           chmod +x Igel-android-arm64-neon
+
+          echo "===== Packaged binary ====="
+
+          ls -lh Igel-android-arm64-neon
+
+          stat -c '%n %s bytes' \
+            Igel-android-arm64-neon
 
       - name: Verify ARM64 Android binary
         shell: bash
@@ -359,12 +332,12 @@ jobs:
 
           echo "SUCCESS: Binary is AArch64."
 
-      - name: Check Android dynamic dependencies
+      - name: Check Android dependencies
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "===== Dynamic section ====="
+          echo "===== Dynamic dependencies ====="
 
           readelf -d Igel-android-arm64-neon || true
 
@@ -375,6 +348,7 @@ jobs:
             exit 1
           fi
 
+          echo
           echo "SUCCESS: No libc++_shared.so dependency detected."
 
       - name: Check NEON instructions
@@ -389,7 +363,7 @@ jobs:
             Igel-android-arm64-neon \
             > disassembly.txt
 
-          echo "===== Searching for AArch64 SIMD/NEON ====="
+          echo "===== NEON/SIMD instruction check ====="
 
           if grep -Eq \
             '\b(addv|addp|sqadd|sqdml|smull|umull|fmla|ld1|st1|tbl|zip[12]|uzp[12]|ext)\b' \
@@ -403,14 +377,14 @@ jobs:
 
           fi
 
-      - name: Final binary verification
+      - name: Final verification
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "========================================"
-          echo "        FINAL IGEL ANDROID BINARY"
-          echo "========================================"
+          echo "=========================================="
+          echo "       FINAL IGEL ANDROID ARM64"
+          echo "=========================================="
 
           ls -lh Igel-android-arm64-neon
 
@@ -423,10 +397,11 @@ jobs:
               'Class:|Machine:|Type:|OS/ABI:'
 
           echo
-          echo "========================================"
-          echo "Expected:"
-          echo "ELF 64-bit LSB pie executable, ARM aarch64"
-          echo "========================================"
+          echo "Binary size:"
+          stat -c '%s bytes' Igel-android-arm64-neon
+
+          echo
+          echo "=========================================="
 
       - name: Package single binary
         shell: bash
@@ -444,7 +419,7 @@ jobs:
           find artifact \
             -maxdepth 1 \
             -type f \
-            -printf '%f\n'
+            -printf '%f %s bytes\n'
 
       - name: Upload Igel ARM64 NEON
         uses: actions/upload-artifact@v4
