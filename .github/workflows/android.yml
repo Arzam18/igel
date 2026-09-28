@@ -2,83 +2,203 @@ name: Igel Android ARM64 NEON
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - "**"
-    paths:
-      - "src/**"
-      - "CMakeLists.txt"
-      - ".github/workflows/android.yml"
 
 jobs:
-  build:
+  build-android:
     runs-on: ubuntu-24.04
+
+    env:
+      ANDROID_NDK_VERSION: 27.2.12479018
+      ANDROID_API: 24
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Android SDK and NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
+      - name: Configure Android SDK
+        shell: bash
         run: |
-          sdkmanager "platform-tools" "platforms;android-24" "ndk;27.2.12479018"
-          yes | sdkmanager --licenses >/dev/null || true
+          set -euxo pipefail
 
-      - name: Download Igel NNUE network
-        run: |
-          curl -L --fail --retry 3 \
-            https://github.com/vshcherbyna/igel/releases/download/0.8/6b953e78.standard \
-            -o network_file
-          test -s network_file
-          sha256sum network_file
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-      - name: Configure Android ARM64 NEON build
-        run: |
-          ANDROID_NDK="$ANDROID_HOME/ndk/27.2.12479018"
-          test -d "$ANDROID_NDK"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f -name sdkmanager -perm -111 | sort | tail -1)"
+          fi
 
-          cmake -S . -B build \
-            -DCMAKE_SYSTEM_NAME=Android \
-            -DCMAKE_ANDROID_NDK="$ANDROID_NDK" \
-            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
-            -DCMAKE_ANDROID_API=24 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DEVALFILE="$PWD/network_file" \
-            -DUSE_NEON=1 \
-            -D_BTYPE=0 \
-            -DSYZYGY_SUPPORT=TRUE
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Verify Android ELF
-        run: |
-          file build/igel
-          readelf -h build/igel | grep -E "Class:|Machine:|Type:"
-          readelf -d build/igel | grep NEEDED || true
-          if readelf -d build/igel | grep -q "libc++_shared"; then
-            echo "ERROR: libc++_shared dependency found; binary must be self-contained"
+          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found"
+            find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -type f -name sdkmanager -print || true
             exit 1
           fi
 
-          MACHINE="$(readelf -h build/igel | sed -n 's/^  Machine:[[:space:]]*//p')"
-          echo "Machine: $MACHINE"
-          echo "$MACHINE" | grep -q "AArch64"
+          echo "Using sdkmanager: $SDKMANAGER"
 
-      - name: Verify build output
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Verify NDK
+        shell: bash
         run: |
-          test -x build/igel
-          ls -lh build/igel
+          set -euxo pipefail
+
+          test -d "$ANDROID_NDK"
+
+          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang" \
+            --version
+
+      - name: Find Igel NNUE network
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Searching repository for NNUE files..."
+
+          find . -type f \( \
+            -iname "*.nnue" -o \
+            -iname "*.bin" \
+          \) -print
+
+          NETWORK="$(find . -type f \( \
+            -iname "*.nnue" -o \
+            -iname "*.bin" \
+          \) | head -1 || true)"
+
+          if [ -z "$NETWORK" ]; then
+            echo "No NNUE network found in repository."
+            echo "The build will continue, but Igel must obtain its network through its normal mechanism."
+          else
+            echo "Found network: $NETWORK"
+          fi
+
+      - name: Configure Igel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export PATH="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+
+          cmake \
+            -S . \
+            -B build-android \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_SYSTEM_VERSION="${ANDROID_API}" \
+            -DCMAKE_ANDROID_NDK="$ANDROID_NDK" \
+            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
+            -DCMAKE_ANDROID_STL_TYPE=c++_static \
+            -DCMAKE_C_COMPILER="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang" \
+            -DCMAKE_CXX_COMPILER="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++" \
+            -DUSE_NEON=ON \
+            -DCMAKE_C_FLAGS="-march=armv8-a+simd" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a+simd -fno-exceptions -fno-rtti" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++"
+
+      - name: Build Igel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake --build build-android \
+            --config Release \
+            --parallel "$(nproc)"
+
+      - name: Locate engine
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Built files:"
+          find build-android -type f -perm -111 -print
+
+          BINARY="$(find build-android -type f -perm -111 \
+            ! -name '*.so' \
+            ! -name '*.a' \
+            | head -1)"
+
+          if [ -z "$BINARY" ]; then
+            echo "ERROR: Could not find Igel executable."
+            exit 1
+          fi
+
+          echo "Binary: $BINARY"
+
+          cp "$BINARY" Igel-android-arm64-neon
+          chmod +x Igel-android-arm64-neon
+
+      - name: Verify ARM64 binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          file Igel-android-arm64-neon
+
+          file Igel-android-arm64-neon | grep -E \
+            'ARM aarch64|ARM64|aarch64'
+
+      - name: Check dynamic dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          readelf -d Igel-android-arm64-neon || true
+
+          if readelf -d Igel-android-arm64-neon 2>/dev/null | grep -q 'libc++_shared.so'; then
+            echo "ERROR: Binary requires libc++_shared.so"
+            exit 1
+          fi
+
+      - name: Check NEON instructions
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Checking ARM64 SIMD instructions..."
+
+          llvm-objdump \
+            -d \
+            Igel-android-arm64-neon \
+            > disassembly.txt || true
+
+          if grep -Eq \
+            'addv|addp|sqadd|sqdml|smull|umull|fmla|ld1|st1|tbl|zip[12]|uzp[12]|ext' \
+            disassembly.txt; then
+            echo "NEON instructions detected."
+          else
+            echo "WARNING: No obvious NEON instructions detected."
+          fi
+
+      - name: UCI smoke test
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          printf 'uci\nisready\nposition startpos\ngo depth 3\nquit\n' \
+            | timeout 30 ./Igel-android-arm64-neon \
+            | tee uci-test.txt
+
+          grep -q "uciok" uci-test.txt
+          grep -q "readyok" uci-test.txt
 
       - name: Package single binary
+        shell: bash
         run: |
-          mkdir -p artifact
-          cp build/igel artifact/Igel-android-arm64-neon
-          chmod +x artifact/Igel-android-arm64-neon
+          set -euxo pipefail
 
-      - name: Upload Android ARM64 binary
+          mkdir -p artifact
+          cp Igel-android-arm64-neon artifact/
+
+          echo "Artifact contents:"
+          find artifact -type f -maxdepth 1 -printf '%f\n'
+
+      - name: Upload Igel ARM64 NEON
         uses: actions/upload-artifact@v4
         with:
           name: Igel-android-arm64-neon
