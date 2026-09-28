@@ -112,6 +112,9 @@ void Position::Clear()
     m_ep = NF;
     m_fifty = 0;
     m_hash = 0;
+    m_pawnHash = 0;
+    m_minorHash = 0;
+    m_nonPawnHash[WHITE] = m_nonPawnHash[BLACK] = 0;
     m_Kings[WHITE] = m_Kings[BLACK] = NF;
     m_matIndex[WHITE] = m_matIndex[BLACK] = 0;
     m_ply = 0;
@@ -546,8 +549,13 @@ void Position::UnmakeMove()
     m_side ^= 1;
 
     m_state = undo.previous;
-    if (!m_state)
+
+    if (!m_state) {
         m_state = &m_undos[0];
+#if !defined(PURE_HCE)
+        m_state->accumulator.computed_accumulation = false;
+#endif
+    }
 }
 
 void Position::MakeNullMove()
@@ -590,8 +598,12 @@ void Position::UnmakeNullMove()
 
     m_state = undo.previous;
 
-    if (!m_state)
+    if (!m_state) {
         m_state = &m_undos[0];
+#if !defined(PURE_HCE)
+        m_state->accumulator.computed_accumulation = false;
+#endif
+    }
 }
 
 void Position::MovePiece(PIECE p, FLD from, FLD to, DirtyThreats * threats) {
@@ -618,8 +630,25 @@ void Position::MovePiece(PIECE p, FLD from, FLD to, DirtyThreats * threats) {
     m_hash ^= s_hash[from][p];
     m_hash ^= s_hash[to][p];
 
+    updateCorrectionHashes(p, from);
+    updateCorrectionHashes(p, to);
+
     if (threats)
         updateThreats(p, true, to, threats, moveMask);
+}
+
+void Position::updateCorrectionHashes(PIECE p, FLD f) {
+    const U64 key = s_hash[f][p];
+    const PIECE type = GetPieceType(p);
+
+    if (type == PAWN)
+        m_pawnHash ^= key;
+    else {
+        m_nonPawnHash[GetColor(p)] ^= key;
+
+        if (type == KNIGHT || type == BISHOP)
+            m_minorHash ^= key;
+    }
 }
 
 static inline bool canSliderThreat(PIECE attacked, PIECE slider) {
@@ -761,6 +790,7 @@ void Position::Put(FLD f, PIECE p, DirtyThreats * threats)
     m_board[f] = p;
 
     m_hash ^= s_hash[f][p];
+    updateCorrectionHashes(p, f);
     m_matIndex[side] += s_matIndexDelta[p];
     ++m_count[p];
 
@@ -780,6 +810,7 @@ void Position::Put(FLD f, PIECE p, PieceId & next_piece_id)
     m_board[f] = p;
 
     m_hash ^= s_hash[f][p];
+    updateCorrectionHashes(p, f);
     m_matIndex[side] += s_matIndexDelta[p];
     ++m_count[p];
 
@@ -851,6 +882,7 @@ void Position::Remove(FLD f, DirtyThreats * threats)
     m_board[f] = NOPIECE;
 
     m_hash ^= s_hash[f][p];
+    updateCorrectionHashes(p, f);
     m_matIndex[side] -= s_matIndexDelta[p];
     --m_count[p];
 }
@@ -1221,13 +1253,12 @@ std::uint32_t Position::getActiveIndexes(COLOR c, std::uint32_t indexes[]) {
     return count;
 }
 
-std::pair<std::uint32_t, std::uint32_t> Position::getChangedIndexes(COLOR c, std::uint32_t added[], std::uint32_t removed[]) {
+std::pair<std::uint32_t, std::uint32_t> Position::getChangedIndexes(COLOR c, const DirtyPiece & dp, std::uint32_t added[], std::uint32_t removed[]) {
     const PieceId target = static_cast<PieceId>(PIECE_ID_KING + c);
     auto pieces = c == WHITE ? evalList.piece_list_fw() : evalList.piece_list_fb();
     Square kingSq = static_cast<Square>((pieces[target] - PS_KING) % SQUARE_NB);
 
     kingSq = FLIP[c][kingSq];
-    const auto & dp = state()->dirtyPiece;
 
     // Precompute once per call: orient(kingSq, kingSq, c) = kingSq ^ flip_mask
     const int flip_mask = (bool(c) * SQ_A8) ^ ((Col(kingSq) < FILE_E) * SQ_H1);

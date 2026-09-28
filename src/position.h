@@ -157,6 +157,9 @@ public:
     int    Fifty() const { return m_fifty; }
     U64    GetAttacks(FLD to, COLOR side, U64 occ) const;
     FORCE_INLINE U64 Hash() const { return m_hash ^ s_hashSide[m_side] ^ s_hashCastlings[m_castlings] ^ s_hashEP[m_ep]; }
+    U64    pawnHash() const { return m_pawnHash; }
+    U64    minorHash() const { return m_minorHash; }
+    U64    nonPawnHash(COLOR side) const { return m_nonPawnHash[side]; }
     bool   InCheck() const { return IsAttacked(King(m_side), m_side ^ 1); }
     bool   IsAttacked(FLD f, COLOR side) const;
     FLD    King(COLOR side) const { return m_Kings[side]; }
@@ -190,7 +193,7 @@ public:
     const EvalList * eval_list() const;
     inline PieceId piece_id_on(Square sq) const;
     std::uint32_t getActiveIndexes(COLOR c, std::uint32_t indexes[]);
-    std::pair<std::uint32_t, std::uint32_t> getChangedIndexes(COLOR c, std::uint32_t added[], std::uint32_t removed[]);
+    std::pair<std::uint32_t, std::uint32_t> getChangedIndexes(COLOR c, const DirtyPiece & dp, std::uint32_t added[], std::uint32_t removed[]);
     inline std::uint32_t makeIndex(Square sq_k, Square sq, Piece p, COLOR c);
 #endif
 
@@ -200,6 +203,7 @@ private:
     void Put(FLD f, PIECE p, PieceId & next_piece_id);
     void Remove(FLD f, DirtyThreats * threats = nullptr);
     void MovePiece(PIECE p, FLD from, FLD to, DirtyThreats * threats = nullptr);
+    void updateCorrectionHashes(PIECE p, FLD f);
 
     template <bool Discovered = true>
     void updateThreats(PIECE p, bool placing, FLD f, DirtyThreats * threats, U64 moveMask = ~0ull) const;
@@ -221,6 +225,9 @@ private:
     FLD   m_ep;
     int   m_fifty;
     U64   m_hash;
+    U64   m_pawnHash;
+    U64   m_minorHash;
+    U64   m_nonPawnHash[2];
     FLD   m_Kings[2];
     int   m_matIndex[2];
     int   m_ply;
