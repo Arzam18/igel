@@ -1,70 +1,86 @@
-name: Build Igel for Android (ARM64)
+name: Igel Android ARM64 NEON
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/android.yml"
 
 jobs:
-  build-android-arm64:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Install Dependencies
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build wget curl
+          sdkmanager "platform-tools" "platforms;android-24" "ndk;27.2.12479018"
+          yes | sdkmanager --licenses >/dev/null || true
 
-      - name: Fetch NNUE Weights
+      - name: Download Igel NNUE network
         run: |
-          mkdir -p weights
-          wget -q https://raw.githubusercontent.com/vslavov/igel/master/weights/6b953e78.standard -O weights/6b953e78.standard || true
+          curl -L --fail --retry 3 \
+            https://github.com/vshcherbyna/igel/releases/download/0.8/6b953e78.standard \
+            -o network_file
+          test -s network_file
+          sha256sum network_file
 
-      - name: Patch for ARM64 Cross-Compilation
+      - name: Configure Android ARM64 NEON build
         run: |
-          # 1. Download sse2neon from the correct repo (DLTcollab/sse2neon)
-          curl -sSL -f https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o src/sse2neon.h
+          ANDROID_NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          test -d "$ANDROID_NDK"
 
-          # 2. Replace x86 header inclusions with sse2neon on ARM targets
-          find src/ -type f \( -name "*.h" -o -name "*.cpp" \) -exec sed -i \
-            's/#include <immintrin.h>/#if defined(__aarch64__) || defined(__arm__)\n#include "sse2neon.h"\n#else\n#include <immintrin.h>\n#endif/g' {} +
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_ANDROID_NDK="$ANDROID_NDK" \
+            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
+            -DCMAKE_ANDROID_API=24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEVALFILE="$PWD/network_file" \
+            -DUSE_NEON=1 \
+            -D_BTYPE=0 \
+            -DSYZYGY_SUPPORT=TRUE
 
-          find src/ -type f \( -name "*.h" -o -name "*.cpp" \) -exec sed -i \
-            's/#include <x86intrin.h>/#if defined(__aarch64__) || defined(__arm__)\n#include "sse2neon.h"\n#else\n#include <x86intrin.h>\n#endif/g' {} +
+      - name: Build
+        run: cmake --build build --parallel
 
-          # 3. Strip x86-specific compiler flags from CMakeLists.txt
-          sed -i 's/-march=native//g' CMakeLists.txt
-          sed -i 's/-mavx2//g' CMakeLists.txt
-          sed -i 's/-msse[^ ]*//g' CMakeLists.txt
-          sed -i -E 's/-fuse-ld=[^ ]*//g' CMakeLists.txt
-
-      - name: Configure CMake
+      - name: Verify Android ELF
         run: |
-          cmake -B build_arm64 \
-            -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
+          file build/igel
+          readelf -h build/igel | grep -E "Class:|Machine:|Type:"
+          readelf -d build/igel | grep NEEDED || true
+          if readelf -d build/igel | grep -q "libc++_shared"; then
+            echo "ERROR: libc++_shared dependency found; binary must be self-contained"
+            exit 1
+          fi
 
-      - name: Build Binary
+          MACHINE="$(readelf -h build/igel | sed -n 's/^  Machine:[[:space:]]*//p')"
+          echo "Machine: $MACHINE"
+          echo "$MACHINE" | grep -q "AArch64"
+
+      - name: Verify build output
         run: |
-          cmake --build build_arm64 --config Release
+          test -x build/igel
+          ls -lh build/igel
 
-      - name: Prepare Artifact
+      - name: Package single binary
         run: |
-          mkdir -p output
-          cp build_arm64/igel* output/igel-android-arm64-v8a || true
+          mkdir -p artifact
+          cp build/igel artifact/Igel-android-arm64-neon
+          chmod +x artifact/Igel-android-arm64-neon
 
-      - name: Upload Binary Artifact
+      - name: Upload Android ARM64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: igel-android-arm64-v8a
-          path: output/
+          name: Igel-android-arm64-neon
+          path: artifact/Igel-android-arm64-neon
+          if-no-files-found: error
