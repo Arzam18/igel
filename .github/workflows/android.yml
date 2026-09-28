@@ -20,16 +20,11 @@ jobs:
         run: |
           set -euxo pipefail
 
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager -perm -111 | sort | tail -1)"
 
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-              -type f -name sdkmanager -perm -111 | sort | tail -1)"
-          fi
-
-          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
+          if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found"
-            find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -type f -name sdkmanager -print || true
             exit 1
           fi
 
@@ -44,6 +39,72 @@ jobs:
 
           echo "ANDROID_NDK=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
 
+      - name: Download Igel NNUE
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          curl -L \
+            --fail \
+            --retry 5 \
+            --retry-all-errors \
+            -o network_file \
+            https://github.com/vshcherbyna/igel/releases/download/0.8/6b953e78.standard
+
+          test -s network_file
+
+          ls -lh network_file
+
+      - name: Android compatibility patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("src/nnue.cpp")
+          s = p.read_text()
+
+          old = """#if defined(_WIN32)
+              void * raw = _aligned_malloc(bytes, HugePage);
+          #else
+              void * raw = std::aligned_alloc(HugePage, bytes);
+          #endif
+          """
+
+          new = """#if defined(_WIN32)
+              void * raw = _aligned_malloc(bytes, HugePage);
+          #elif defined(__ANDROID__)
+              void * raw = nullptr;
+              if (posix_memalign(&raw, HugePage, bytes) != 0)
+                  raw = nullptr;
+          #else
+              void * raw = std::aligned_alloc(HugePage, bytes);
+          #endif
+          """
+
+          if old in s:
+              s = s.replace(old, new)
+          elif "std::aligned_alloc(HugePage, bytes)" in s:
+              s = s.replace(
+                  "void * raw = std::aligned_alloc(HugePage, bytes);",
+                  """void * raw = nullptr;
+          #if defined(__ANDROID__)
+              if (posix_memalign(&raw, HugePage, bytes) != 0)
+                  raw = nullptr;
+          #else
+              raw = std::aligned_alloc(HugePage, bytes);
+          #endif"""
+              )
+          else:
+              raise SystemExit("Could not locate aligned_alloc code in src/nnue.cpp")
+
+          p.write_text(s)
+          PY
+
+          grep -n -A12 -B4 "posix_memalign" src/nnue.cpp
+
       - name: Verify NDK
         shell: bash
         run: |
@@ -51,32 +112,8 @@ jobs:
 
           test -d "$ANDROID_NDK"
 
-          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang" \
+          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++" \
             --version
-
-      - name: Find Igel NNUE network
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "Searching repository for NNUE files..."
-
-          find . -type f \( \
-            -iname "*.nnue" -o \
-            -iname "*.bin" \
-          \) -print
-
-          NETWORK="$(find . -type f \( \
-            -iname "*.nnue" -o \
-            -iname "*.bin" \
-          \) | head -1 || true)"
-
-          if [ -z "$NETWORK" ]; then
-            echo "No NNUE network found in repository."
-            echo "The build will continue, but Igel must obtain its network through its normal mechanism."
-          else
-            echo "Found network: $NETWORK"
-          fi
 
       - name: Configure Igel
         shell: bash
@@ -96,10 +133,10 @@ jobs:
             -DCMAKE_ANDROID_STL_TYPE=c++_static \
             -DCMAKE_C_COMPILER="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang" \
             -DCMAKE_CXX_COMPILER="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++" \
+            -DEVALFILE="$GITHUB_WORKSPACE/network_file" \
             -DUSE_NEON=ON \
             -DCMAKE_C_FLAGS="-march=armv8-a+simd" \
-            -DCMAKE_CXX_FLAGS="-march=armv8-a+simd -fno-exceptions -fno-rtti" \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++"
+            -DCMAKE_CXX_FLAGS="-march=armv8-a+simd -O3 -fno-exceptions -fno-rtti"
 
       - name: Build Igel
         shell: bash
@@ -118,7 +155,9 @@ jobs:
           echo "Built files:"
           find build-android -type f -perm -111 -print
 
-          BINARY="$(find build-android -type f -perm -111 \
+          BINARY="$(find build-android \
+            -type f \
+            -perm -111 \
             ! -name '*.so' \
             ! -name '*.a' \
             | head -1)"
@@ -150,7 +189,8 @@ jobs:
 
           readelf -d Igel-android-arm64-neon || true
 
-          if readelf -d Igel-android-arm64-neon 2>/dev/null | grep -q 'libc++_shared.so'; then
+          if readelf -d Igel-android-arm64-neon 2>/dev/null \
+              | grep -q 'libc++_shared.so'; then
             echo "ERROR: Binary requires libc++_shared.so"
             exit 1
           fi
@@ -159,8 +199,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
-          echo "Checking ARM64 SIMD instructions..."
 
           llvm-objdump \
             -d \
@@ -195,8 +233,7 @@ jobs:
           mkdir -p artifact
           cp Igel-android-arm64-neon artifact/
 
-          echo "Artifact contents:"
-          find artifact -type f -maxdepth 1 -printf '%f\n'
+          find artifact -maxdepth 1 -type f -printf '%f\n'
 
       - name: Upload Igel ARM64 NEON
         uses: actions/upload-artifact@v4
