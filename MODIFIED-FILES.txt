@@ -1,0 +1,12 @@
+Igel 3.8.6 Android ARM64 NEON overlay
+Apply by extracting this ZIP over the repository root of the supplied Igel 3.8.6 source.
+All listed source files preserve their original relative paths.
+
+.github/workflows/android.yml
+ANDROID-ARM64-PORT-3.8.6.md
+CMakeLists.txt
+src/main.cpp
+src/nnue.cpp
+src/nnue.h
+src/uci.cpp
+src/uci.h
