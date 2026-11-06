@@ -38,13 +38,14 @@ const std::string PROGRAM_NAME = "Igel HCE";
 const std::string PROGRAM_NAME = "Igel";
 #endif
 const std::string ARCHITECTURE = " 64 "
-
+#if defined(USE_NEON)
+"NEON"
+#else
 #if _BTYPE==0
 "POPCNT "
 #else
 "BMI2 "
 #endif
-
 #if defined(USE_AVX512)
 "AVX512"
 #if defined(USE_VNNI)
@@ -54,6 +55,7 @@ const std::string ARCHITECTURE = " 64 "
 "AVX2"
 #if defined(USE_AVXVNNI)
 " VNNI256"
+#endif
 #endif
 #endif
 ;

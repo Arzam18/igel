@@ -23,7 +23,11 @@
 #include <string>
 #include <memory>
 #include <cstdint>
+#if defined(USE_NEON)
+#include <arm_neon.h>
+#else
 #include <immintrin.h>
+#endif
 
 #include "types.h"
 #include "threats.h"
@@ -44,7 +48,11 @@ const EVAL VAL_K = 20000;
 #define LAYERED_NETWORKS 8
 #define WEIGHTS_SCALE    16
 #define PSQT_THRESHOLD   1400
+#if defined(USE_NEON)
+#define SIMD_WIDTH       16
+#else
 #define SIMD_WIDTH       32
+#endif
 #define TILE_HEIGHT      256
 #define NUM_REGS         16
 #define NUM_PSQT_REGS    1

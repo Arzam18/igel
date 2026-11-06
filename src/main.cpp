@@ -30,7 +30,11 @@
 
 int main(int argc, const char* argv[])
 {
-    static_assert(USE_AVX2 == 1, "AVX2 is the minimum supported build type");
+#if defined(USE_AVX2)
+    static_assert(USE_AVX2 == 1, "AVX2 is the minimum supported x86 build type");
+#elif defined(USE_NEON)
+    static_assert(sizeof(void*) == 8, "The NEON build must target 64-bit ARM");
+#endif
 
     //
     //  initialize igel
