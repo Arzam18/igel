@@ -1,0 +1,372 @@
+
+name: Igel Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+
+    env:
+      ANDROID_NDK_VERSION: 27.2.12479018
+      ANDROID_API: 24
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f \
+            -name sdkmanager \
+            -perm -111 \
+            | sort \
+            | tail -1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found"
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" \
+            >> "$GITHUB_ENV"
+
+      - name: Verify Android NDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -d "$ANDROID_NDK"
+
+          NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          test -x "$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang"
+          test -x "$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang++"
+
+          test -f "$ANDROID_NDK/build/cmake/android.toolchain.cmake"
+
+          echo "NDK:"
+          echo "$ANDROID_NDK"
+
+          echo
+          echo "C compiler:"
+          "$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang" \
+            --version
+
+          echo
+          echo "C++ compiler:"
+          "$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang++" \
+            --version
+
+      - name: Verify Android ARM64 compiler
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          CC="$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang"
+          CXX="$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang++"
+
+          CC_TARGET="$("$CC" -dumpmachine)"
+          CXX_TARGET="$("$CXX" -dumpmachine)"
+
+          echo "C target:   $CC_TARGET"
+          echo "C++ target: $CXX_TARGET"
+
+          if ! echo "$CC_TARGET" \
+              | grep -Eq '^aarch64-(unknown-)?linux-android'; then
+            echo "ERROR: C compiler is not Android AArch64."
+            exit 1
+          fi
+
+          if ! echo "$CXX_TARGET" \
+              | grep -Eq '^aarch64-(unknown-)?linux-android'; then
+            echo "ERROR: C++ compiler is not Android AArch64."
+            exit 1
+          fi
+
+          echo
+          echo "SUCCESS: Android ARM64 compiler confirmed."
+
+      - name: Download Igel NNUE
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          curl -L \
+            --fail \
+            --retry 5 \
+            --retry-all-errors \
+            -o network_file \
+            https://github.com/vshcherbyna/igel/releases/download/0.8/5adc00b8.standard
+
+          test -s network_file
+
+          echo "NNUE network:"
+          ls -lh network_file
+
+      - name: Configure Igel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf build-android
+
+          cmake \
+            -S . \
+            -B build-android \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEVALFILE="$GITHUB_WORKSPACE/network_file" \
+            -DUSE_NEON=ON \
+            -D_BTYPE=0 \
+            -DCMAKE_C_FLAGS="-march=armv8-a+simd" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a+simd -O3 -fno-rtti" \
+            -DCMAKE_EXE_LINKER_FLAGS=""
+
+          echo
+          echo "===== CMake target ====="
+
+          grep -n \
+            "ADD_EXECUTABLE" \
+            CMakeLists.txt
+
+          echo
+          echo "===== CMake configuration ====="
+
+          cmake \
+            -LAH \
+            -N \
+            build-android \
+            | grep -E \
+              'CMAKE_(C|CXX)_COMPILER|CMAKE_SYSTEM_NAME|CMAKE_SYSTEM_PROCESSOR|CMAKE_ANDROID_ARCH_ABI|ANDROID_ABI|ANDROID_PLATFORM' \
+              || true
+
+      - name: Verify CMake Android configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== Searching CMake compiler configuration ====="
+
+          if grep -R \
+              -E \
+              'aarch64-(unknown-)?linux-android' \
+              build-android/CMakeFiles \
+              >/dev/null 2>&1; then
+
+            echo "SUCCESS: CMake is configured for Android AArch64."
+
+          else
+
+            echo "ERROR: Android AArch64 compiler was not found in CMake configuration."
+            exit 1
+
+          fi
+
+      - name: Build Igel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake --build build-android \
+            --target igel \
+            --parallel "$(nproc)" \
+            --verbose
+
+      - name: Verify actual Igel target exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== Expected target ====="
+
+          ls -lah build-android/igel
+
+          test -f build-android/igel
+          test -x build-android/igel
+
+          echo
+          echo "===== Actual Igel target ====="
+
+          file build-android/igel
+
+          echo
+          echo "===== Size ====="
+
+          stat -c '%n %s bytes' build-android/igel
+
+          SIZE="$(stat -c '%s' build-android/igel)"
+
+          if [ "$SIZE" -lt 100000 ]; then
+            echo "ERROR: Igel executable is suspiciously small:"
+            echo "$SIZE bytes"
+            exit 1
+          fi
+
+          echo "SUCCESS: Igel target has a plausible size."
+
+      - name: Package actual Igel binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp build-android/igel \
+            Igel-3.8.6-android-arm64-neon
+
+          chmod +x Igel-3.8.6-android-arm64-neon
+
+          echo "===== Packaged binary ====="
+
+          ls -lh Igel-3.8.6-android-arm64-neon
+
+          stat -c '%n %s bytes' \
+            Igel-3.8.6-android-arm64-neon
+
+      - name: Verify ARM64 Android binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== file ====="
+
+          file Igel-3.8.6-android-arm64-neon
+
+          echo
+          echo "===== ELF header ====="
+
+          readelf -h Igel-3.8.6-android-arm64-neon
+
+          echo
+          echo "===== Architecture ====="
+
+          MACHINE="$(
+            readelf -h Igel-3.8.6-android-arm64-neon \
+              | awk -F: '/Machine:/ {
+                  gsub(/^[ \t]+/, "", $2);
+                  print $2
+                }'
+          )"
+
+          echo "Machine: $MACHINE"
+
+          if ! echo "$MACHINE" | grep -qi 'AArch64'; then
+            echo "ERROR: Binary is NOT AArch64."
+            exit 1
+          fi
+
+          echo "SUCCESS: Binary is AArch64."
+
+      - name: Check Android dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== Dynamic dependencies ====="
+
+          readelf -d Igel-3.8.6-android-arm64-neon || true
+
+          if readelf -d Igel-3.8.6-android-arm64-neon 2>/dev/null \
+              | grep -q 'libc++_shared.so'; then
+
+            echo "ERROR: Binary requires libc++_shared.so"
+            exit 1
+          fi
+
+          echo
+          echo "SUCCESS: No libc++_shared.so dependency detected."
+
+      - name: Check NEON instructions
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          NDK_LLVM="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          "$NDK_LLVM/llvm-objdump" \
+            -d \
+            Igel-3.8.6-android-arm64-neon \
+            > disassembly.txt
+
+          echo "===== NEON/SIMD instruction check ====="
+
+          if grep -Eq \
+            '\b(addv|addp|sqadd|sqdml|smull|umull|fmla|ld1|st1|tbl|zip[12]|uzp[12]|ext)\b' \
+            disassembly.txt; then
+
+            echo "NEON/SIMD instructions detected."
+
+          else
+
+            echo "WARNING: No obvious NEON instructions detected."
+
+          fi
+
+      - name: Final verification
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "=========================================="
+          echo "       FINAL IGEL ANDROID ARM64"
+          echo "=========================================="
+
+          ls -lh Igel-3.8.6-android-arm64-neon
+
+          echo
+          file Igel-3.8.6-android-arm64-neon
+
+          echo
+          readelf -h Igel-3.8.6-android-arm64-neon \
+            | grep -E \
+              'Class:|Machine:|Type:|OS/ABI:'
+
+          echo
+          echo "Binary size:"
+          stat -c '%s bytes' Igel-3.8.6-android-arm64-neon
+
+          echo
+          echo "=========================================="
+
+      - name: Package single binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf artifact
+          mkdir -p artifact
+
+          cp Igel-3.8.6-android-arm64-neon \
+            artifact/Igel-3.8.6-android-arm64-neon
+
+          echo "Artifact contents:"
+
+          find artifact \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f %s bytes\n'
+
+      - name: Upload Igel 3.8.6 ARM64 NEON
+        uses: actions/upload-artifact@v4
+        with:
+          name: Igel-3.8.6-android-arm64-neon
+          path: artifact/Igel-3.8.6-android-arm64-neon
+          if-no-files-found: error
