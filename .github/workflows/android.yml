@@ -99,9 +99,17 @@ jobs:
           # with the exact :STRING cache type; verify the generated platform file
           # and selected compiler instead of grepping one brittle cache spelling.
           grep -R -Eq 'CMAKE_SYSTEM_NAME.*Android' "$BUILD_DIR"/CMakeFiles/*/CMakeSystem.cmake
-          grep -Fq "$ANDROID_TOOLCHAIN/bin/clang++" "$BUILD_DIR/CMakeCache.txt"
-          grep -Eq -- "(--target(=|[[:space:]])|-target[[:space:]])aarch64-linux-android${ANDROID_API}" "$BUILD_DIR/build.ninja"
-          grep -q -- '-DUSE_NEON=1' "$BUILD_DIR/build.ninja"
+          # NDK compiler wrappers are named aarch64-linux-android${API}-clang++,
+          # not .../bin/clang++. Compare the exact compiler recorded by CMake.
+          CACHE_CXX="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "$BUILD_DIR/CMakeCache.txt" | tail -n 1)"
+          if [[ "$CACHE_CXX" != "$ANDROID_CXX" ]]; then
+            echo "ERROR: CMake selected an unexpected compiler: $CACHE_CXX"
+            echo "Expected Android compiler: $ANDROID_CXX"
+            exit 1
+          fi
+          # The versioned NDK wrapper itself encodes the Android target/API.
+          grep -Fq "$ANDROID_CXX" "$BUILD_DIR/build.ninja"
+          grep -Fq -- '-DUSE_NEON=1' "$BUILD_DIR/build.ninja"
           if grep -E -- '-mavx2|-mavx512|-mbmi2|-mavxvnni|-DUSE_AVX2=|-DUSE_AVX512=|-DUSE_AVXVNNI=' "$BUILD_DIR/build.ninja"; then
             echo "ERROR: x86-only flags/backend macros leaked into the NEON build"
             exit 1
@@ -142,9 +150,17 @@ jobs:
             -DSYZYGY_SUPPORT=TRUE
 
           grep -R -Eq 'CMAKE_SYSTEM_NAME.*Android' "$BUILD_DIR"/CMakeFiles/*/CMakeSystem.cmake
-          grep -Fq "$ANDROID_TOOLCHAIN/bin/clang++" "$BUILD_DIR/CMakeCache.txt"
-          grep -Eq -- "(--target(=|[[:space:]])|-target[[:space:]])aarch64-linux-android${ANDROID_API}" "$BUILD_DIR/build.ninja"
-          grep -q -- '-DUSE_NEON=1' "$BUILD_DIR/build.ninja"
+          # NDK compiler wrappers are named aarch64-linux-android${API}-clang++,
+          # not .../bin/clang++. Compare the exact compiler recorded by CMake.
+          CACHE_CXX="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "$BUILD_DIR/CMakeCache.txt" | tail -n 1)"
+          if [[ "$CACHE_CXX" != "$ANDROID_CXX" ]]; then
+            echo "ERROR: CMake selected an unexpected compiler: $CACHE_CXX"
+            echo "Expected Android compiler: $ANDROID_CXX"
+            exit 1
+          fi
+          # The versioned NDK wrapper itself encodes the Android target/API.
+          grep -Fq "$ANDROID_CXX" "$BUILD_DIR/build.ninja"
+          grep -Fq -- '-DUSE_NEON=1' "$BUILD_DIR/build.ninja"
           grep -q -- '-DUSE_DOTPROD=1' "$BUILD_DIR/build.ninja"
           grep -q -- '-march=armv8.2-a+dotprod' "$BUILD_DIR/build.ninja"
           if grep -E -- '-mavx2|-mavx512|-mbmi2|-mavxvnni|-DUSE_AVX2=|-DUSE_AVX512=|-DUSE_AVXVNNI=' "$BUILD_DIR/build.ninja"; then
