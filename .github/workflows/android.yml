@@ -1,0 +1,175 @@
+name: Igel Android ARM64 NEON
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'ANDROID-ARM64-PORT-3.8.7b.md'
+  pull_request:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'CMakeLists.txt'
+      - 'src/**'
+      - 'ANDROID-ARM64-PORT-3.8.7b.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_NDK_VERSION: 27.2.12479018
+      ANDROID_API: 24
+      NETWORK_FILE: network_file
+      NETWORK_URL: https://github.com/vshcherbyna/igel/releases/download/0.8/820573bc.universal
+
+    steps:
+      - name: Checkout Igel 3.8.7b source
+        uses: actions/checkout@v4
+
+      - name: Install Android SDK components and NDK r27c
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager -perm -111 | sort -V | tail -n 1)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager was not found under $ANDROID_HOME/cmdline-tools"
+            exit 1
+          fi
+
+          # The runner image may already have accepted some licenses.
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+          NDK_PATH="$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
+          test -x "$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang"
+          test -x "$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang++"
+          test -x "$TOOLCHAIN/bin/llvm-objdump"
+          test -x "$TOOLCHAIN/bin/llvm-readelf"
+
+          echo "ANDROID_NDK=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "ANDROID_CXX=$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang++" >> "$GITHUB_ENV"
+          echo "ANDROID_OBJDUMP=$TOOLCHAIN/bin/llvm-objdump" >> "$GITHUB_ENV"
+          echo "ANDROID_READELF=$TOOLCHAIN/bin/llvm-readelf" >> "$GITHUB_ENV"
+
+      - name: Verify Android AArch64 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_CXX" --version
+          TARGET="$("$ANDROID_CXX" -dumpmachine)"
+          echo "Compiler target: $TARGET"
+          [[ "$TARGET" =~ ^aarch64-(unknown-)?linux-android ]]
+
+      - name: Download and verify Igel 3.8.7b universal NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 5 --retry-all-errors \
+            --retry-delay 2 --connect-timeout 20 \
+            "$NETWORK_URL" -o "$NETWORK_FILE"
+          test -s "$NETWORK_FILE"
+
+          echo "Downloaded network: $(stat -c '%n %s bytes' "$NETWORK_FILE")"
+          echo "Network SHA-256: $(sha256sum "$NETWORK_FILE" | awk '{print $1}')"
+
+      - name: Configure Android ARM64 NEON build
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build-android
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEVALFILE="$GITHUB_WORKSPACE/$NETWORK_FILE" \
+            -DUSE_NEON=ON \
+            -D_BTYPE=0 \
+            -DSYZYGY_SUPPORT=TRUE \
+            -DCMAKE_C_FLAGS="-march=armv8-a+simd" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a+simd -mtune=cortex-a76"
+
+          grep -q '^CMAKE_SYSTEM_NAME:STRING=Android$' build-android/CMakeCache.txt
+          echo "===== Android configuration ====="
+          grep -E 'CMAKE_(C|CXX)_COMPILER:FILEPATH|CMAKE_SYSTEM_NAME:STRING|CMAKE_SYSTEM_PROCESSOR:STRING|ANDROID_ABI|ANDROID_PLATFORM|ANDROID_STL' \
+            build-android/CMakeCache.txt || true
+          grep -R -E 'aarch64-linux-android' build-android/CMakeFiles/CMake* 2>/dev/null | head -20
+
+      - name: Verify target options and NEON selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q -- '-DUSE_NEON=1' build-android/build.ninja
+          if grep -E -- '-mavx2|-mavx512|-mbmi2|-mavxvnni|-DUSE_AVX2=|-DUSE_AVX512=|-DUSE_AVXVNNI=' build-android/build.ninja; then
+            echo "ERROR: An x86-only ISA flag or backend macro leaked into the Android build"
+            exit 1
+          fi
+          echo "Verified: USE_NEON is enabled; no x86-only ISA flags are present."
+
+      - name: Build Igel 3.8.7b
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-android --target igel --parallel "$(nproc)" --verbose
+          test -s build-android/igel
+
+      - name: Verify Android ELF and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=build-android/igel
+          file "$BIN"
+          "$ANDROID_READELF" -h "$BIN"
+          "$ANDROID_READELF" -h "$BIN" | grep -q 'AArch64'
+          SIZE="$(stat -c '%s' "$BIN")"
+          echo "Executable size: $SIZE bytes"
+          if (( SIZE < 100000 )); then
+            echo "ERROR: Igel executable is suspiciously small"
+            exit 1
+          fi
+          if "$ANDROID_READELF" -d "$BIN" 2>/dev/null | grep -q 'libc++_shared.so'; then
+            echo "ERROR: Igel requires libc++_shared.so"
+            exit 1
+          fi
+
+      - name: Verify real NEON instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_OBJDUMP" -d build-android/igel > build-android/igel.disassembly.txt
+          if ! grep -Eiq '\b(saddlp|sadalp|smull|umull|sqxtn|smin|smax|mul|ld1|st1)\b' build-android/igel.disassembly.txt; then
+            echo "ERROR: No expected AArch64 NEON instructions were found"
+            exit 1
+          fi
+          echo "Verified: AArch64 NEON instructions are present in Igel."
+
+      - name: Package engine-only artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp build-android/igel artifact/Igel-3.8.7b-android-arm64-neon
+          chmod +x artifact/Igel-3.8.7b-android-arm64-neon
+          file artifact/Igel-3.8.7b-android-arm64-neon
+          stat -c '%n %s bytes' artifact/Igel-3.8.7b-android-arm64-neon
+          sha256sum artifact/Igel-3.8.7b-android-arm64-neon > artifact/SHA256SUMS.txt
+
+      - name: Upload Igel 3.8.7b Android ARM64 NEON
+        uses: actions/upload-artifact@v4
+        with:
+          name: Igel-3.8.7b-android-arm64-neon
+          path: artifact/*
+          if-no-files-found: error
