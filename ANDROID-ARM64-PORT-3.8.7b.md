@@ -39,9 +39,13 @@ widening multiply/accumulate implementation.
   transformer storage.
 - CMake selects `armv8-a+simd` for baseline builds and
   `armv8.2-a+dotprod` only when `USE_DOTPROD=ON`.
-- The workflow no longer assumes `CMAKE_SYSTEM_NAME` is cached with the exact
-  `:STRING` type; it verifies the generated Android platform file and selected
-  NDK compiler instead.
+- The workflow verifies the generated Android platform file and compares the
+  exact compiler path recorded by CMake with the NDK wrapper
+  `aarch64-linux-android24-clang++`. It does not assume the wrapper is named
+  `clang++` or that a separate `--target` flag appears in Ninja commands.
+- Fix2 corrects an earlier CI guard that searched for the non-existent path
+  `.../bin/clang++`; that check stopped the job immediately after successful
+  CMake generation, before compilation began.
 
 ## Verification boundary
 
