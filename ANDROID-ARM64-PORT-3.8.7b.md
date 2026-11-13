@@ -39,14 +39,15 @@ widening multiply/accumulate implementation.
   transformer storage.
 - CMake selects `armv8-a+simd` for baseline builds and
   `armv8.2-a+dotprod` only when `USE_DOTPROD=ON`.
-- The NDK CMake toolchain selects its generic `clang++` driver and supplies
-  the Android target and ABI through toolchain settings. The workflow validates
-  the requested `arm64-v8a` ABI and API 24 cache entries, confirms that Ninja
-  uses the NDK's generic Clang driver, and then verifies the resulting ELF
-  machine type. It deliberately does not require CMake's compiler path to equal
-  the versioned `aarch64-linux-android24-clang++` wrapper used for direct builds.
-- Fix3 removes the incorrect compiler-path equality test that rejected the
-  valid generic Clang driver after CMake had already configured successfully.
+- The NDK CMake toolchain is allowed to select its generic `clang++` driver;
+  the workflow no longer compares that path to the API-specific compiler
+  wrapper. The toolchain file carries the Android target and ABI settings.
+- Fix4 removes brittle text matches against `CMakeCache.txt` and `build.ninja`
+  that could fail after successful generation but before compilation. Each
+  build step now traces commands and preserves the full verbose compiler log.
+- The final ELF checks verify `AArch64`, Android's `/system/bin/linker64`
+  interpreter, static C++ runtime linkage, and NEON instructions. The Dotprod
+  executable must additionally contain an actual `SDOT` instruction.
 
 ## Verification boundary
 
