@@ -40,7 +40,11 @@ const std::string PROGRAM_NAME = "Igel";
 #endif
 const std::string ARCHITECTURE = " 64 "
 #if defined(USE_NEON)
+#if defined(USE_DOTPROD)
+"NEON SDOT"
+#else
 "NEON"
+#endif
 #else
 #if _BTYPE==0
 "POPCNT "

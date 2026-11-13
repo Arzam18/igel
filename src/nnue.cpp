@@ -37,6 +37,10 @@
 #include <array>
 #include <vector>
 
+#if defined(USE_DOTPROD) && (!defined(USE_NEON) || !defined(__aarch64__) || !defined(__ARM_FEATURE_DOTPROD))
+#error "USE_DOTPROD requires an AArch64 NEON build targeting ARMv8.2-A Dotprod"
+#endif
+
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <sys/mman.h>
 #endif
@@ -533,12 +537,12 @@ static inline void applyDelta(const Transformer & t, std::int16_t * out, const s
 #endif
 }
 
+#if defined(USE_AVX2)
 inline __m256i vec_msb_pack_16(__m256i a, __m256i b) {
     __m256i compacted = _mm256_packs_epi16(_mm256_srli_epi16(a, 7), _mm256_srli_epi16(b, 7));
     return _mm256_permute4x64_epi64(compacted, 0b11011000);
 }
 
-#if defined(USE_AVX2)
 inline __m256i affine_acc_256(__m256i acc, __m256i a, __m256i b) {
 #if defined(USE_AVXVNNI)
     return _mm256_dpbusd_epi32(acc, a, b);
@@ -551,11 +555,17 @@ inline __m256i affine_acc_256(__m256i acc, __m256i a, __m256i b) {
 
 #if defined(USE_NEON)
 inline int32x4_t affine_acc_neon(int32x4_t acc, uint8x16_t a, int8x16_t b) {
-    // NNUE clipped activations are in [0, 127], so signed reinterpretation is exact.
+    // Every NNUE activation is clipped to [0, 127], so interpreting its byte
+    // representation as signed is exact. The weights are already signed int8.
     const int8x16_t as = vreinterpretq_s8_u8(a);
+#if defined(USE_DOTPROD)
+    // Exact signed 8-bit dot product: sum(acc + activation[i] * weight[i]).
+    return vdotq_s32(acc, as, b);
+#else
     acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(as), vget_low_s8(b)));
     acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(as), vget_high_s8(b)));
     return acc;
+#endif
 }
 #endif
 
@@ -576,6 +586,7 @@ inline __m512i affine_acc_512(__m512i acc, __m512i a, __m512i b) {
 }
 #endif
 
+#if defined(USE_AVX2) || defined(USE_AVX512)
 inline __m128i m256_haddx4(__m256i s0, __m256i s1, __m256i s2, __m256i s3, __m128i bias) {
     s0 = _mm256_hadd_epi32(s0, s1);
     s2 = _mm256_hadd_epi32(s2, s3);
@@ -584,6 +595,7 @@ inline __m128i m256_haddx4(__m256i s0, __m256i s1, __m256i s2, __m256i s3, __m12
     const __m128i hi = _mm256_extracti128_si256(s0, 1);
     return _mm_add_epi32(_mm_add_epi32(lo, hi), bias);
 }
+#endif
 
 #if defined(USE_AVX512)
 inline __m128i m512_haddx4(__m512i s0, __m512i s1, __m512i s2, __m512i s3, __m128i bias) {
@@ -772,15 +784,11 @@ static void refreshPerspective(Transformer & t, Position & pos, COLOR c) {
 
     U64 changedSlots = 0;
 
-#if defined(USE_AVX512)
-    for (int b = 0; b < 2; ++b)
-        changedSlots |= U64(_mm512_cmpneq_epi32_mask(_mm512_loadu_si512(&entry.pieces[16 * b]), _mm512_loadu_si512(&pieces[16 * b]))) << (16 * b);
-#else
-    for (int b = 0; b < 4; ++b) {
-        const __m256i same = _mm256_cmpeq_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(&entry.pieces[8 * b])), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&pieces[8 * b])));
-        changedSlots |= U64(~_mm256_movemask_ps(_mm256_castsi256_ps(same)) & 0xFF) << (8 * b);
-    }
-#endif
+    // Keep the 32-slot comparison ISA-neutral. The vectorized x86 version
+    // used __m256i even in the non-AVX2 branch, which made ARM builds fail.
+    for (int i = 0; i < EvalList::MAX_LENGTH; ++i)
+        if (entry.pieces[i] != pieces[i])
+            changedSlots |= U64(1) << i;
 
     while (changedSlots) {
         const int  i     = PopLSB(changedSlots) ^ 63;
