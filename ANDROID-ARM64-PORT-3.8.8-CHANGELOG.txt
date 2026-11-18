@@ -1,0 +1,69 @@
+IGEL 3.8.8 ANDROID ARM64 PORT — CHANGE LOG
+
+TARGET
+- Uploaded source archive: igel-master.zip
+- Engine identity read from src/uci.cpp: 3.8.8
+- Android ABI: arm64-v8a; API 24; NDK r27c (27.2.12479018)
+- Outputs: baseline NEON and ARMv8.2-A Dotprod/SDOT
+
+FILES CHANGED
+
+1. .github/workflows/android.yml
+   - Adds workflow_dispatch inputs uci_date (YYYYMMDD) and network_url.
+   - Downloads NDK r27c directly from Google's official archive and verifies its SHA-1 before use; avoids the previously problematic setup-android/sdkmanager route.
+   - Builds separate arm64-v8a NEON and Dotprod variants with static libc++.
+   - Uses the supplied uci_date in the UCI version identity.
+   - Checks ELF64/AArch64 output, rejects libc++_shared.so, starts the engine to verify NNUE loading and UCI identity, checks NEON instructions or SDOT in disassembly, and uploads engine-only artifacts with checksums.
+   - Default network URL points to the 6b953e78 standard network announced for official Igel 3.8.0. It is overridable because the uploaded 3.8.8 source itself does not declare a network URL. Engine startup validation is intended to reject an incompatible network.
+
+2. CMakeLists.txt
+   - Adds an Android-specific compile branch.
+   - Defines USE_NEON and optionally USE_DOTPROD.
+   - Avoids applying x86-only -march=native, -mavx2, BMI2, AVX-512, and AVX-VNNI flags to Android.
+   - Leaves existing non-Android build branches intact.
+
+3. src/main.cpp
+   - Replaces the AVX2-only compile-time requirement with a requirement for either AVX2 or the ARM NEON backend.
+
+4. src/nnue.h
+   - Selects arm_neon.h for USE_NEON and immintrin.h otherwise.
+   - Uses a 16-byte SIMD width for NEON while retaining 32 for the existing x86 path.
+
+5. src/nnue.cpp
+   - Selects ARM NEON or x86 intrinsic headers conditionally and adds a compile-time guard for invalid Dotprod configurations.
+   - Uses posix_memalign on Android for the transformer's 2 MiB-aligned allocation; the existing matching free() path remains valid.
+   - Adds NEON accumulator-delta updates, PSQT updates, feature transformation, affine propagation, clipped ReLU, and square-clipped activation.
+   - Uses signed vdotq_s32 for Dotprod. Inputs are clipped to [0,127] before signed-byte reinterpretation; weights are signed int8. The baseline NEON path uses widening multiply-accumulate.
+   - Keeps the 3.8.8 accumulator refresh cache and network-generation invalidation.
+   - Keeps x86 AVX2/AVX-512 refresh-cache comparisons and sparse first-layer weight reordering/propagation on their original x86 branches. Android uses the serialized row-major first-layer weights with a NEON dense propagation path; the x86 sparse optimization is not yet ported to ARM.
+
+6. src/uci.cpp
+   - Reports ARM64 NEON and optional DOTPROD in the architecture identity.
+   - Appends the workflow-supplied build date to the 3.8.8 UCI version identity when defined.
+
+7. README.md
+   - Updates the documented standard-network download URL to the official 3.8.0 release network asset.
+
+8. ANDROID-ARM64-PORT-3.8.8.md
+   - Documents the Android target, implementation decisions, network override, and validation status.
+
+9. ANDROID-ARM64-PORT-3.8.8-CHANGELOG.txt
+   - This file-level change log.
+
+INSPECTED AND CONFIRMED UNCHANGED
+- Engine version remains 3.8.8; no 3.8.7b engine internals were transplanted.
+- Transformer dimensions, network serialization, layer dimensions, weights, biases, threat data, and evaluation scaling were not changed.
+- The 3.8.8 per-thread refresh cache, network-generation counter, and network load/replication lifecycle were preserved.
+- src/numa.h still excludes Android from NUMA_BINDING; Android uses the existing single-network path.
+- Existing x86 AVX2/AVX-512 propagation and sparse first-layer layout remain in their x86-specific branches.
+- Search, move generation, time management, transposition table, and chess rules were not changed.
+- Existing non-Android workflows were not modified.
+
+VALIDATION / LIMITATIONS
+- Full host x86 AVX2 CMake build: passed (using a dummy compile-time network file; this validates compilation, not NNUE runtime).
+- Isolated AArch64 NEON intrinsic compilation: passed.
+- Isolated AArch64 Dotprod intrinsic compilation: passed; disassembly contains SDOT.
+- Android NDK full-source cross-build: not run in this environment because the NDK is unavailable here. GitHub Actions is configured to perform it.
+- Android runtime, real network compatibility, NPS, and playing strength: not yet verified.
+- The default network is based on the official 3.8.0 release announcement, not an explicit network declaration in the uploaded 3.8.8 source. Override network_url if the correct 3.8.8 network is different; the workflow's UCI startup check should fail if the chosen network cannot be loaded.
+- ARM first-layer propagation is correct dense NEON but does not yet implement the newer x86 sparse-input optimization. This may affect NPS and should be measured on-device before further optimization.
