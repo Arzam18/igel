@@ -1,0 +1,114 @@
+name: Build Igel Android ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      uci_date:
+        description: UCI build identity date (YYYYMMDD)
+        required: true
+        type: string
+        default: "20261118"
+      network_url:
+        description: NNUE network URL compatible with this source revision
+        required: true
+        type: string
+        default: "https://github.com/vshcherbyna/igel/releases/download/3.8.0/6b953e78"
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: NEON
+            march: armv8-a+simd
+            dotprod: OFF
+            artifact: igel-3.8.8-android-arm64-neon
+          - variant: NEON-Dotprod
+            march: armv8.2-a+dotprod
+            dotprod: ON
+            artifact: igel-3.8.8-android-arm64-dotprod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Install Android NDK r27c (pinned and checksum-verified)
+        run: |
+          ZIP="$RUNNER_TEMP/android-ndk-r27c-linux.zip"
+          curl --fail --location --retry 3 \
+            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
+            --output "$ZIP"
+          echo "090e8083a715fdb1a3e402d0763c388abb03fb4e  $ZIP" | sha1sum --check --status
+          unzip -q "$ZIP" -d "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r27c" >> "$GITHUB_ENV"
+          cmake --version
+          ninja --version
+
+      - name: Fetch Igel NNUE network
+        run: |
+          curl --fail --location --retry 3 \
+            "${{ inputs.network_url }}" --output network_file
+          test -s network_file
+          sha256sum network_file | tee network_file.sha256
+
+      - name: Configure Android ARM64
+        env:
+          BUILD_DATE: ${{ inputs.uci_date }}
+        run: |
+          if ! [[ "$BUILD_DATE" =~ ^[0-9]{8}$ ]]; then echo "uci_date must be YYYYMMDD"; exit 1; fi
+          VARIANT_DIR="build-${{ matrix.variant }}"
+          cmake -S . -B "$VARIANT_DIR" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEVALFILE="$GITHUB_WORKSPACE/network_file" \
+            -D_BTYPE=0 \
+            -DUSE_DOTPROD=${{ matrix.dotprod }} \
+            -DCMAKE_C_FLAGS="-march=${{ matrix.march }}" \
+            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76 -DIGEL_BUILD_DATE=\"${BUILD_DATE}\"" \
+            -DCMAKE_VERBOSE_MAKEFILE=ON
+          grep -E 'CMAKE_CXX_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:STRING|ANDROID_ABI|ANDROID_PLATFORM' "$VARIANT_DIR/CMakeCache.txt" || true
+
+      - name: Build engine
+        run: |
+          cmake --build "build-${{ matrix.variant }}" --target igel --parallel "$(nproc)" --verbose 2>&1 | tee "build-${{ matrix.variant }}.log"
+
+      - name: Verify ARM64 binary and instruction set
+        run: |
+          BIN="build-${{ matrix.variant }}/igel"
+          test -s "$BIN"
+          file "$BIN"
+          readelf -h "$BIN" | grep -q 'Class:.*ELF64'
+          readelf -h "$BIN" | grep -q 'Machine:.*AArch64'
+          if readelf -d "$BIN" | grep -q 'libc++_shared.so'; then echo "Unexpected shared libc++ dependency"; exit 1; fi
+          printf 'uci\nquit\n' | "$BIN" | tee "build-${{ matrix.variant }}.uci.log"
+          grep -q 'id name Igel 3.8.8' "build-${{ matrix.variant }}.uci.log" || { echo "Engine failed NNUE startup or UCI identity check"; exit 1; }
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump" -d "$BIN" > "build-${{ matrix.variant }}.disasm"
+          if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
+            grep -Eiq '\bsdot\b' "build-${{ matrix.variant }}.disasm" || { echo "SDOT instruction not found"; exit 1; }
+          else
+            grep -Eiq '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*\b' "build-${{ matrix.variant }}.disasm" || { echo "Expected NEON arithmetic not found"; exit 1; }
+          fi
+          mkdir -p artifact
+          cp "$BIN" "artifact/${{ matrix.artifact }}"
+          chmod +x "artifact/${{ matrix.artifact }}"
+          sha256sum "artifact/${{ matrix.artifact }}" > "artifact/${{ matrix.artifact }}.sha256"
+          cp network_file.sha256 artifact/
+
+      - name: Upload engine-only artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact/*
+          if-no-files-found: error
