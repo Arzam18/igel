@@ -78,15 +78,24 @@ jobs:
           mkdir -p "$RUNNER_TEMP/android-ndk"
           unzip -q "$NDK_ARCHIVE" -d "$RUNNER_TEMP/android-ndk"
 
-          NDK_PATH="$RUNNER_TEMP/android-ndk/android-ndk-${NDK_REVISION}"
+          # The archive extracts to android-ndk-r27c.
+          NDK_PATH="$RUNNER_TEMP/android-ndk/android-ndk-r27c"
 
-          test -x "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          NDK_COMPILER="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+
+          if [[ ! -x "$NDK_COMPILER" ]]; then
+            echo "ERROR: Android NDK compiler not found."
+            echo "Expected: $NDK_COMPILER"
+            echo "Extracted directories:"
+            find "$RUNNER_TEMP/android-ndk" -maxdepth 3 -type d
+            exit 1
+          fi
 
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
           echo "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
-          echo "Installed Android NDK:"
+          echo "Android NDK r27c installed successfully."
           "$NDK_PATH/ndk-build" --version
 
       - name: Verify Igel source and ARM64 implementations
@@ -96,20 +105,17 @@ jobs:
 
           echo "===== Igel version ====="
           grep -Fq 'const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;' src/uci.cpp
-
           echo "Igel 3.8.10 source identity confirmed."
 
           echo "===== ARM64 NEON implementation ====="
           grep -Fq '"ARM64 NEON"' src/uci.cpp
           grep -Fq '#include <arm_neon.h>' src/nnue.cpp
           grep -Fq 'inline int32x4_t affine_acc_neon' src/nnue.cpp
-
           echo "ARM64 NEON implementation confirmed."
 
           echo "===== DotProd implementation ====="
           grep -Fq 'vdotq_s32' src/nnue.cpp
           grep -Fq '" DOTPROD"' src/uci.cpp
-
           echo "DotProd implementation confirmed."
 
       - name: Download NNUE network
@@ -137,7 +143,6 @@ jobs:
           set -euo pipefail
 
           NDK_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
-
           test -f "$NDK_TOOLCHAIN"
 
           cmake \
@@ -162,7 +167,6 @@ jobs:
           set -euo pipefail
 
           COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
-
           test -s "$COMPILE_COMMANDS"
 
           echo "===== Compiler definitions ====="
@@ -310,7 +314,6 @@ jobs:
           STAGING="${{ matrix.build_dir }}/artifact"
 
           mkdir -p "$STAGING"
-
           cp "$BIN" "$STAGING/igel"
 
           (
