@@ -60,7 +60,8 @@ jobs:
             unzip \
             curl \
             file \
-            binutils
+            binutils \
+            python3
 
       - name: Download and install Android NDK r27c
         shell: bash
@@ -177,106 +178,145 @@ jobs:
             -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76" \
             -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76"
 
-      - name: Verify NDK compiler and architecture configuration
+      - name: Verify actual compiler commands and ARM64 flags
         shell: bash
         run: |
           set -euo pipefail
 
-          BUILD_DIR="${{ matrix.build_dir }}"
-          CMAKE_CACHE="$BUILD_DIR/CMakeCache.txt"
-          COMPILE_COMMANDS="$BUILD_DIR/compile_commands.json"
+          COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
 
-          test -s "$CMAKE_CACHE"
           test -s "$COMPILE_COMMANDS"
 
-          echo "===== Read actual CMake compiler paths ====="
+          echo "===== Verify actual NDK compiler commands ====="
 
-          get_cache_value() {
-            local key="$1"
-            local line
+          python3 - \
+            "$COMPILE_COMMANDS" \
+            "$ANDROID_NDK_HOME" \
+            "${{ matrix.march }}" \
+            "${{ matrix.dotprod }}" <<'PY'
+          import json
+          import os
+          import shlex
+          import shutil
+          import sys
+          from pathlib import Path
 
-            line="$(grep -m1 -E "^${key}:[^=]*=" "$CMAKE_CACHE" || true)"
+          compile_file = Path(sys.argv[1])
+          ndk_home = Path(sys.argv[2]).resolve()
+          expected_march = sys.argv[3]
+          dotprod = sys.argv[4]
 
-            if [[ -z "$line" ]]; then
-              echo "ERROR: $key is missing from CMakeCache.txt."
-              return 1
-            fi
+          ndk_bin = (
+              ndk_home
+              / "toolchains"
+              / "llvm"
+              / "prebuilt"
+              / "linux-x86_64"
+              / "bin"
+          ).resolve()
 
-            printf '%s' "${line#*=}"
-          }
+          with compile_file.open("r", encoding="utf-8") as f:
+              commands = json.load(f)
 
-          C_COMPILER="$(get_cache_value CMAKE_C_COMPILER)"
-          CXX_COMPILER="$(get_cache_value CMAKE_CXX_COMPILER)"
+          if not isinstance(commands, list) or not commands:
+              raise SystemExit("ERROR: compile_commands.json is empty.")
 
-          echo "C compiler:   $C_COMPILER"
-          echo "C++ compiler: $CXX_COMPILER"
+          cpp_commands = []
 
-          echo "===== Verify actual NDK compiler directory ====="
+          for entry in commands:
+              source = entry.get("file", "")
+              suffix = Path(source).suffix.lower()
 
-          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+              if suffix not in (".cpp", ".cc", ".cxx", ".c++"):
+                  continue
 
-          NDK_BIN_REAL="$(readlink -f "$NDK_BIN")"
-          C_COMPILER_REAL="$(readlink -f "$C_COMPILER")"
-          CXX_COMPILER_REAL="$(readlink -f "$CXX_COMPILER")"
+              if "arguments" in entry:
+                  args = entry["arguments"]
+              elif "command" in entry:
+                  args = shlex.split(entry["command"])
+              else:
+                  raise SystemExit(
+                      f"ERROR: No compiler command for {source}"
+                  )
 
-          if [[ ! -x "$C_COMPILER" ]]; then
-            echo "ERROR: Configured C compiler is not executable."
-            exit 1
-          fi
+              if not args:
+                  raise SystemExit(
+                      f"ERROR: Empty compiler command for {source}"
+                  )
 
-          if [[ ! -x "$CXX_COMPILER" ]]; then
-            echo "ERROR: Configured C++ compiler is not executable."
-            exit 1
-          fi
+              cpp_commands.append((source, args))
 
-          C_COMPILER_DIR="$(dirname "$C_COMPILER_REAL")"
-          CXX_COMPILER_DIR="$(dirname "$CXX_COMPILER_REAL")"
+          if not cpp_commands:
+              raise SystemExit(
+                  "ERROR: No C++ compilation commands were found."
+              )
 
-          if [[ "$C_COMPILER_DIR" != "$NDK_BIN_REAL" ]]; then
-            echo "ERROR: C compiler does not resolve inside the NDK toolchain."
-            echo "Resolved compiler: $C_COMPILER_REAL"
-            echo "Expected directory: $NDK_BIN_REAL"
-            exit 1
-          fi
+          print(f"C++ compilation commands: {len(cpp_commands)}")
+          print(f"Expected NDK compiler directory: {ndk_bin}")
 
-          if [[ "$CXX_COMPILER_DIR" != "$NDK_BIN_REAL" ]]; then
-            echo "ERROR: C++ compiler does not resolve inside the NDK toolchain."
-            echo "Resolved compiler: $CXX_COMPILER_REAL"
-            echo "Expected directory: $NDK_BIN_REAL"
-            exit 1
-          fi
+          for source, args in cpp_commands:
+              compiler = args[0]
 
-          echo "NDK C compiler confirmed."
-          echo "NDK C++ compiler confirmed."
+              if os.path.isabs(compiler):
+                  compiler_path = Path(compiler)
+              else:
+                  found = shutil.which(compiler)
+                  if found is None:
+                      raise SystemExit(
+                          f"ERROR: Compiler not found: {compiler}"
+                      )
+                  compiler_path = Path(found)
 
-          echo "===== Verify NEON compiler definition ====="
+              compiler_real = compiler_path.resolve()
 
-          grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
+              try:
+                  compiler_real.relative_to(ndk_bin)
+              except ValueError:
+                  raise SystemExit(
+                      "ERROR: C++ compilation does not use the NDK compiler.\n"
+                      f"Source: {source}\n"
+                      f"Compiler: {compiler_real}\n"
+                      f"Expected under: {ndk_bin}"
+                  )
 
-          echo "USE_NEON=1 confirmed."
+              flags = set(args[1:])
 
-          echo "===== Verify DotProd compiler definition ====="
+              required_flags = {
+                  f"-march={expected_march}",
+                  "-mtune=cortex-a76",
+                  "-DUSE_NEON=1",
+              }
 
-          if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
-            echo "USE_DOTPROD=1 confirmed."
-          else
-            if grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"; then
-              echo "ERROR: DOTPROD unexpectedly enabled in baseline NEON build."
-              exit 1
-            fi
+              missing = required_flags - flags
 
-            echo "Baseline NEON correctly excludes USE_DOTPROD."
-          fi
+              if missing:
+                  raise SystemExit(
+                      f"ERROR: Required flags missing for {source}: "
+                      + ", ".join(sorted(missing))
+                  )
 
-          echo "===== Verify architecture flags ====="
+              has_dotprod = "-DUSE_DOTPROD=1" in flags
 
-          grep -Fq -- "-march=${{ matrix.march }}" "$COMPILE_COMMANDS"
-          grep -Fq -- "-mtune=cortex-a76" "$COMPILE_COMMANDS"
+              if dotprod == "ON" and not has_dotprod:
+                  raise SystemExit(
+                      f"ERROR: DotProd definition missing for {source}"
+                  )
 
-          echo "Architecture flags confirmed."
-          echo "-march=${{ matrix.march }}"
-          echo "-mtune=cortex-a76"
+              if dotprod == "OFF" and has_dotprod:
+                  raise SystemExit(
+                      f"ERROR: Unexpected DotProd definition in {source}"
+                  )
+
+          print("NDK C++ compiler verified for all C++ compilation commands.")
+          print(f"-march={expected_march} verified.")
+          print("-mtune=cortex-a76 verified.")
+          print("-DUSE_NEON=1 verified.")
+
+          if dotprod == "ON":
+              print("-DUSE_DOTPROD=1 verified.")
+          else:
+              print("Baseline NEON correctly excludes USE_DOTPROD.")
+          PY
 
       - name: Build Igel
         shell: bash
@@ -298,7 +338,12 @@ jobs:
 
           echo "===== Binary information ====="
 
-          file "$BIN"
+          file "$BIN" | tee "${{ matrix.build_dir }}/binary-info.txt"
+
+          grep -Fq 'ELF 64-bit' "${{ matrix.build_dir }}/binary-info.txt"
+          grep -Fq 'ARM aarch64' "${{ matrix.build_dir }}/binary-info.txt"
+          grep -Fq "for Android ${ANDROID_API}" "${{ matrix.build_dir }}/binary-info.txt"
+          grep -Fq '/system/bin/linker64' "${{ matrix.build_dir }}/binary-info.txt"
 
           readelf -h "$BIN" | grep -F 'ELF64'
           readelf -h "$BIN" | grep -F 'AArch64'
