@@ -80,14 +80,22 @@ jobs:
           unzip -q "$NDK_ARCHIVE" -d "$RUNNER_TEMP/android-ndk"
 
           NDK_PATH="$RUNNER_TEMP/android-ndk/android-ndk-r27c"
-
           NDK_BIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          NDK_COMPILER="$NDK_BIN/aarch64-linux-android24-clang++"
 
-          if [[ ! -x "$NDK_COMPILER" ]]; then
-            echo "ERROR: Android API 24 target compiler not found."
-            echo "Expected: $NDK_COMPILER"
-            find "$RUNNER_TEMP/android-ndk" -maxdepth 4 -type f -name 'clang++'
+          if [[ ! -x "$NDK_BIN/clang++" ]]; then
+            echo "ERROR: NDK clang++ not found."
+            echo "Expected: $NDK_BIN/clang++"
+            find "$RUNNER_TEMP/android-ndk" -maxdepth 5 -type f -name 'clang++'
+            exit 1
+          fi
+
+          if [[ ! -x "$NDK_BIN/clang" ]]; then
+            echo "ERROR: NDK clang not found."
+            exit 1
+          fi
+
+          if [[ ! -x "$NDK_BIN/llvm-objdump" ]]; then
+            echo "ERROR: NDK llvm-objdump not found."
             exit 1
           fi
 
@@ -169,40 +177,85 @@ jobs:
             -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76" \
             -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76"
 
-      - name: Verify compiler configuration
+      - name: Verify NDK compiler and architecture configuration
         shell: bash
         run: |
           set -euo pipefail
 
           BUILD_DIR="${{ matrix.build_dir }}"
-          COMPILE_COMMANDS="$BUILD_DIR/compile_commands.json"
           CMAKE_CACHE="$BUILD_DIR/CMakeCache.txt"
+          COMPILE_COMMANDS="$BUILD_DIR/compile_commands.json"
 
-          test -s "$COMPILE_COMMANDS"
           test -s "$CMAKE_CACHE"
+          test -s "$COMPILE_COMMANDS"
 
-          echo "===== NDK C++ compiler ====="
+          echo "===== Read actual CMake compiler paths ====="
 
-          NDK_CLANGXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          get_cache_value() {
+            local key="$1"
+            local line
 
-          test -x "$NDK_CLANGXX"
+            line="$(grep -m1 -E "^${key}:[^=]*=" "$CMAKE_CACHE" || true)"
 
-          if ! grep -Fq "$NDK_CLANGXX" "$CMAKE_CACHE"; then
-            echo "ERROR: CMake is not configured with the expected NDK clang++."
-            grep -E 'CMAKE_CXX_COMPILER:|CMAKE_C_COMPILER:' "$CMAKE_CACHE" || true
+            if [[ -z "$line" ]]; then
+              echo "ERROR: $key is missing from CMakeCache.txt."
+              return 1
+            fi
+
+            printf '%s' "${line#*=}"
+          }
+
+          C_COMPILER="$(get_cache_value CMAKE_C_COMPILER)"
+          CXX_COMPILER="$(get_cache_value CMAKE_CXX_COMPILER)"
+
+          echo "C compiler:   $C_COMPILER"
+          echo "C++ compiler: $CXX_COMPILER"
+
+          echo "===== Verify actual NDK compiler directory ====="
+
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          NDK_BIN_REAL="$(readlink -f "$NDK_BIN")"
+          C_COMPILER_REAL="$(readlink -f "$C_COMPILER")"
+          CXX_COMPILER_REAL="$(readlink -f "$CXX_COMPILER")"
+
+          if [[ ! -x "$C_COMPILER" ]]; then
+            echo "ERROR: Configured C compiler is not executable."
             exit 1
           fi
 
-          echo "NDK clang++ compiler confirmed:"
-          echo "$NDK_CLANGXX"
+          if [[ ! -x "$CXX_COMPILER" ]]; then
+            echo "ERROR: Configured C++ compiler is not executable."
+            exit 1
+          fi
 
-          echo "===== NEON compiler definition ====="
+          C_COMPILER_DIR="$(dirname "$C_COMPILER_REAL")"
+          CXX_COMPILER_DIR="$(dirname "$CXX_COMPILER_REAL")"
+
+          if [[ "$C_COMPILER_DIR" != "$NDK_BIN_REAL" ]]; then
+            echo "ERROR: C compiler does not resolve inside the NDK toolchain."
+            echo "Resolved compiler: $C_COMPILER_REAL"
+            echo "Expected directory: $NDK_BIN_REAL"
+            exit 1
+          fi
+
+          if [[ "$CXX_COMPILER_DIR" != "$NDK_BIN_REAL" ]]; then
+            echo "ERROR: C++ compiler does not resolve inside the NDK toolchain."
+            echo "Resolved compiler: $CXX_COMPILER_REAL"
+            echo "Expected directory: $NDK_BIN_REAL"
+            exit 1
+          fi
+
+          echo "NDK C compiler confirmed."
+          echo "NDK C++ compiler confirmed."
+
+          echo "===== Verify NEON compiler definition ====="
 
           grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
 
           echo "USE_NEON=1 confirmed."
 
-          echo "===== DotProd compiler definition ====="
+          echo "===== Verify DotProd compiler definition ====="
 
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
             grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
@@ -216,12 +269,12 @@ jobs:
             echo "Baseline NEON correctly excludes USE_DOTPROD."
           fi
 
-          echo "===== Architecture compiler flags ====="
+          echo "===== Verify architecture flags ====="
 
           grep -Fq -- "-march=${{ matrix.march }}" "$COMPILE_COMMANDS"
           grep -Fq -- "-mtune=cortex-a76" "$COMPILE_COMMANDS"
 
-          echo "Architecture flags confirmed:"
+          echo "Architecture flags confirmed."
           echo "-march=${{ matrix.march }}"
           echo "-mtune=cortex-a76"
 
@@ -258,55 +311,20 @@ jobs:
 
           echo "Android ARM64 ELF verification passed."
 
-      - name: Verify UCI identity and Android build configuration
+      - name: Verify UCI source identity
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "===== Source UCI identity ====="
+          echo "===== UCI identity ====="
 
           grep -Fq 'const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;' src/uci.cpp
           grep -Fq '"ARM64 NEON"' src/uci.cpp
           grep -Fq '" DOTPROD"' src/uci.cpp
+
           grep -Fq 'std::cout << "id name " << PROGRAM_NAME << " " << VERSION << ARCHITECTURE' src/uci.cpp
 
-          echo "Igel 3.8.10 UCI identity is present in source."
-
-          echo "===== Compiler definitions ====="
-
-          COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
-
-          grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
-
-          if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
-            echo "NEON and DOTPROD definitions confirmed."
-          else
-            if grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"; then
-              echo "ERROR: Baseline NEON build unexpectedly has DOTPROD enabled."
-              exit 1
-            fi
-
-            echo "Baseline NEON compiler definition confirmed."
-          fi
-
-          echo "===== Android ARM64 ELF verification ====="
-
-          BIN="${{ matrix.build_dir }}/igel"
-
-          test -s "$BIN"
-          file "$BIN"
-
-          readelf -h "$BIN" | grep -E 'Class:.*ELF64'
-          readelf -h "$BIN" | grep -E 'Machine:.*AArch64'
-          readelf -l "$BIN" | grep -F '/system/bin/linker64'
-
-          if readelf -d "$BIN" | grep -Fq 'libc++_shared.so'; then
-            echo "ERROR: Binary depends on libc++_shared.so."
-            exit 1
-          fi
-
-          echo "Android ARM64 checks passed."
+          echo "Igel 3.8.10 UCI source identity confirmed."
 
       - name: Verify generated ARM64 instructions
         shell: bash
