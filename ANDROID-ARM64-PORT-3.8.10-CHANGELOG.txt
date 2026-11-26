@@ -1,0 +1,38 @@
+# Igel 3.8.10 Android ARM64 port — change log
+
+Base: upstream Igel 3.8.10 snapshot `d176e251b330daa8920e0cce96f583bd87c1353e`.
+
+Changed files:
+
+1. `.github/workflows/android.yml` — added manual-only workflow_dispatch with required uci_date and configurable 3.8.10-compatible network URL; builds separate ARM64 NEON and DotProd engine-only artifacts using NDK r27c/API 24; verifies ELF architecture, static libc++ linkage and disassembly; writes binary/network checksums.
+2. `CMakeLists.txt` — isolates Android from upstream x86-only `-march=native`, `-mavx2`, and LTO flags; defines USE_NEON and optional USE_DOTPROD for Android while leaving the existing non-Android build logic intact.
+3. `src/main.cpp` — accepts either the upstream AVX2 backend or the Android NEON backend at the compile-time build guard.
+4. `src/nnue.h` — selects `<arm_neon.h>` for Android NEON and uses 16-byte SIMD width; x86 remains unchanged.
+5. `src/nnue.cpp` — adds ARM header guard, DotProd contract, Android `posix_memalign`, NEON accumulator delta/PSQT update, NEON transformer activation, safe scalar fallback for refresh changed-slot detection, NEON dense affine dot product, NEON clipped activation and square activation. Keeps 3.8.10 AVX2 sparse layout and propagation behind USE_AVX2.
+6. `src/uci.cpp` — restores optional build-date identity and reports `ARM64 NEON` / `DOTPROD` for Android instead of x86 POPCNT/BMI2 labels.
+7. `README.md` — documents the manual Android workflow and its default network/date inputs.
+8. `ANDROID-ARM64-PORT-3.8.10.md` — port design, source identity and validation boundaries.
+9. `ANDROID-ARM64-PORT-3.8.10-CHANGELOG.txt` — this file.
+
+Inspected and preserved unchanged:
+
+- Upstream 3.8.10 network file declaration `weights/820573bc.universal` and matching release URL.
+- New 3.8.10 history bonus clamp ordering.
+- 3.8.10 universal network choice for both standard and FRC targets.
+- NNUE model layout, transformer/network load format, refresh cache and network-generation invalidation.
+- NUMA implementation; Android continues to compile without `NUMA_BINDING`.
+- Search, move generation, move ordering and Syzygy/Fathom source logic.
+- Non-Android AVX2/AVX512/AVXVNNI code paths and build flags.
+
+Not yet verified by this port operation: complete Android NDK cross-build in GitHub Actions, successful startup with the real network on Android, NPS, thermals, and playing strength. The workflow does not attempt to execute the Android binary on the Linux runner.
+
+Validation performed for this package:
+
+- Full x86-64 AVX2 host compile and link completed using GCC 14.2 with a one-byte fixture network. This validates compilation/linkage only, not NNUE loading or chess strength.
+- Android CMake branch fixture configure passed and confirmed `USE_NEON` / `USE_DOTPROD` definitions without x86 `-march=native` or `-mavx2` flags.
+- Focused AArch64 NEON intrinsic test cross-compiled for `armv8-a+simd`; disassembly showed widening multiply and NEON arithmetic and no SDOT.
+- Focused AArch64 DotProd intrinsic test cross-compiled for `armv8.2-a+dotprod`; disassembly showed SDOT.
+- Workflow YAML parsed successfully; all embedded shell `run` blocks passed `bash -n`; the workflow has only the `workflow_dispatch` trigger.
+- Build-date macro string concatenation test passed.
+
+Not performed: full Android NDK r27c compile/link, real universal-network startup, on-device runtime, NPS, thermal or playing-strength tests. The Android NDK was not available in the local build environment.

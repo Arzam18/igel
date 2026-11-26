@@ -147,3 +147,7 @@ on Windows, or:
 on Linux. The `Nodes` figure it prints must match the `bench:` value in the latest commit message.
 If the two differ, your binary is not searching the same tree as the reference build, and any result
 it produces cannot be compared with published ones.
+
+## Android ARM64 builds
+
+The repository includes a manual GitHub Actions workflow at `.github/workflows/android.yml`. Run **Build Igel Android ARM64** using `workflow_dispatch` to build the baseline NEON or optimized DotProd variants. The workflow uses the `820573bc.universal` network by default and accepts a build identity date in `YYYYMMDD` format.
