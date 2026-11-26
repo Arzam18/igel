@@ -22,7 +22,11 @@
 #include "position.h"
 #include "hce.h"
 #include "utils.h"
+#if defined(USE_NEON)
+#include <arm_neon.h>
+#else
 #include <immintrin.h>
+#endif
 #include <algorithm>
 #include <new>
 #include <cstdlib>
@@ -32,6 +36,11 @@
 #include <atomic>
 #include <array>
 #include <vector>
+#include <cstring>
+
+#if defined(USE_DOTPROD) && (!defined(USE_NEON) || !defined(__aarch64__) || !defined(__ARM_FEATURE_DOTPROD))
+#error "USE_DOTPROD requires an AArch64 NEON build targeting ARMv8.2-A Dotprod"
+#endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <sys/mman.h>
@@ -273,6 +282,10 @@ static void * allocTransformer() {
 
 #if defined(_WIN32)
     void * raw = _aligned_malloc(bytes, HugePage);
+#elif defined(__ANDROID__)
+    void * raw = nullptr;
+    if (posix_memalign(&raw, HugePage, bytes) != 0)
+        raw = nullptr;
 #else
     void * raw = std::aligned_alloc(HugePage, bytes);
 #endif
@@ -430,7 +443,43 @@ static inline void applyDelta(const Transformer & t, std::int16_t * out, const s
     for (std::size_t i = 0; i < thrAdded.size(); ++i)
         psqt = _mm256_add_epi32(psqt, _mm256_load_si256(reinterpret_cast<const __m256i*>(t.threatPsqts(thrAdded[i]))));
 
-    _mm256_store_si256(reinterpret_cast<__m256i*>(psqtOut), psqt);
+#elif defined(USE_NEON)
+    using acc_vec_t = int16x8_t;
+    constexpr std::uint32_t Regs = NUM_REGS / 2;
+    constexpr std::uint32_t TileHeight = Regs * sizeof(acc_vec_t) / sizeof(std::int16_t);
+    constexpr std::uint32_t NumTiles = Transformer::HalfDimensions / TileHeight;
+    static_assert(Transformer::HalfDimensions % TileHeight == 0);
+    const std::int8_t * thrColumns[2 * ThreatList::MAX_LENGTH];
+    const std::size_t thrRemovedCount = thrRemoved.size();
+    const std::size_t thrCount = thrRemovedCount + thrAdded.size();
+    for (std::size_t i = 0; i < thrRemovedCount; ++i) thrColumns[i] = t.threatWeights(thrRemoved[i]);
+    for (std::size_t i = 0; i < thrAdded.size(); ++i) thrColumns[thrRemovedCount + i] = t.threatWeights(thrAdded[i]);
+    for (std::uint32_t tile = 0; tile < NumTiles; ++tile) {
+        const std::uint32_t offset = tile * TileHeight;
+        const auto inTile = reinterpret_cast<const acc_vec_t*>(in + offset);
+        auto outTile = reinterpret_cast<acc_vec_t*>(out + offset);
+        acc_vec_t acc[Regs];
+        for (std::uint32_t k = 0; k < Regs; ++k) acc[k] = inTile[k];
+        for (std::uint32_t i = 0; i < removedCount; ++i) {
+            const auto col = reinterpret_cast<const acc_vec_t*>(&t.weights[Transformer::HalfDimensions * removed[i] + offset]);
+            for (std::uint32_t k = 0; k < Regs; ++k) acc[k] = vsubq_s16(acc[k], col[k]);
+        }
+        for (std::uint32_t i = 0; i < addedCount; ++i) {
+            const auto col = reinterpret_cast<const acc_vec_t*>(&t.weights[Transformer::HalfDimensions * added[i] + offset]);
+            for (std::uint32_t k = 0; k < Regs; ++k) acc[k] = vaddq_s16(acc[k], col[k]);
+        }
+        for (std::size_t i = 0; i < thrRemovedCount; ++i) for (std::uint32_t k = 0; k < Regs; ++k)
+            acc[k] = vsubq_s16(acc[k], vmovl_s8(vld1_s8(thrColumns[i] + offset + k * 8)));
+        for (std::size_t i = thrRemovedCount; i < thrCount; ++i) for (std::uint32_t k = 0; k < Regs; ++k)
+            acc[k] = vaddq_s16(acc[k], vmovl_s8(vld1_s8(thrColumns[i] + offset + k * 8)));
+        for (std::uint32_t k = 0; k < Regs; ++k) outTile[k] = acc[k];
+    }
+    int32x4_t q0 = vld1q_s32(psqtIn), q1 = vld1q_s32(psqtIn + 4);
+    for (std::uint32_t i = 0; i < removedCount; ++i) { const auto q = &t.psqts[removed[i] * PSQT_BUCKETS]; q0 = vsubq_s32(q0, vld1q_s32(q)); q1 = vsubq_s32(q1, vld1q_s32(q + 4)); }
+    for (std::uint32_t i = 0; i < addedCount; ++i) { const auto q = &t.psqts[added[i] * PSQT_BUCKETS]; q0 = vaddq_s32(q0, vld1q_s32(q)); q1 = vaddq_s32(q1, vld1q_s32(q + 4)); }
+    for (std::size_t i = 0; i < thrRemovedCount; ++i) { const auto q = t.threatPsqts(thrRemoved[i]); q0 = vsubq_s32(q0, vld1q_s32(q)); q1 = vsubq_s32(q1, vld1q_s32(q + 4)); }
+    for (std::size_t i = 0; i < thrAdded.size(); ++i) { const auto q = t.threatPsqts(thrAdded[i]); q0 = vaddq_s32(q0, vld1q_s32(q)); q1 = vaddq_s32(q1, vld1q_s32(q + 4)); }
+    vst1q_s32(psqtOut, q0); vst1q_s32(psqtOut + 4, q1);
 #else
     (void)thrRemoved;
     (void)thrAdded;
@@ -450,18 +499,32 @@ static inline void applyDelta(const Transformer & t, std::int16_t * out, const s
 #endif
 }
 
+#if defined(USE_AVX2)
 inline __m256i vec_msb_pack_16(__m256i a, __m256i b) {
     __m256i compacted = _mm256_packs_epi16(_mm256_srli_epi16(a, 7), _mm256_srli_epi16(b, 7));
     return _mm256_permute4x64_epi64(compacted, 0b11011000);
 }
 
-#if defined(USE_AVX2)
+
 inline __m256i affine_acc_256(__m256i acc, __m256i a, __m256i b) {
 #if defined(USE_AVXVNNI)
     return _mm256_dpbusd_epi32(acc, a, b);
 #else
     const __m256i ones = _mm256_set1_epi16(1);
     return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), ones));
+#endif
+}
+#endif
+
+#if defined(USE_NEON)
+inline int32x4_t affine_acc_neon(int32x4_t acc, uint8x16_t a, int8x16_t b) {
+    // NNUE activations are clipped to [0,127], so reinterpretation as signed bytes is exact.
+    const int8x16_t signedA = vreinterpretq_s8_u8(a);
+#if defined(USE_DOTPROD)
+    return vdotq_s32(acc, signedA, b);
+#else
+    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(signedA), vget_low_s8(b)));
+    return vpadalq_s16(acc, vmull_s8(vget_high_s8(signedA), vget_high_s8(b)));
 #endif
 }
 #endif
@@ -483,6 +546,7 @@ inline __m512i affine_acc_512(__m512i acc, __m512i a, __m512i b) {
 }
 #endif
 
+#if defined(USE_AVX2) || defined(USE_AVX512)
 inline __m128i m256_haddx4(__m256i s0, __m256i s1, __m256i s2, __m256i s3, __m128i bias) {
     s0 = _mm256_hadd_epi32(s0, s1);
     s2 = _mm256_hadd_epi32(s2, s3);
@@ -491,6 +555,7 @@ inline __m128i m256_haddx4(__m256i s0, __m256i s1, __m256i s2, __m256i s3, __m12
     const __m128i hi = _mm256_extracti128_si256(s0, 1);
     return _mm_add_epi32(_mm_add_epi32(lo, hi), bias);
 }
+#endif
 
 #if defined(USE_AVX512)
 inline __m128i m512_haddx4(__m512i s0, __m512i s1, __m512i s2, __m512i s3, __m128i bias) {
@@ -571,6 +636,19 @@ std::int32_t Transformer::transform(Position & pos, std::uint8_t * outBuffer, co
             const __m256i pb = _mm256_mullo_epi16(sum0b, sum1b);
 
             out[j] = vec_msb_pack_16(pa, pb);
+        }
+#elif defined(USE_NEON)
+        const std::int16_t * in0 = acc[sides[side]];
+        const std::int16_t * in1 = acc[sides[side]] + HalfDimensions / 2;
+        std::uint8_t * out = outBuffer + offset;
+        const int16x8_t zero = vdupq_n_s16(0), one = vdupq_n_s16(127);
+        for (std::uint32_t j = 0; j < HalfDimensions / 2; j += 32) {
+            for (int k = 0; k < 4; ++k) {
+                int16x8_t a = vminq_s16(vmaxq_s16(vld1q_s16(in0 + j + k * 8), zero), one);
+                int16x8_t b = vminq_s16(vmaxq_s16(vld1q_s16(in1 + j + k * 8), zero), one);
+                int16x8_t product = vshrq_n_s16(vmulq_s16(a, b), 7);
+                vst1_s8(reinterpret_cast<std::int8_t*>(out + j + k * 8), vmovn_s16(product));
+            }
         }
 #endif
     }
@@ -655,11 +733,15 @@ static void refreshPerspective(Transformer & t, Position & pos, COLOR c) {
 #if defined(USE_AVX512)
     for (int b = 0; b < 2; ++b)
         changedSlots |= U64(_mm512_cmpneq_epi32_mask(_mm512_loadu_si512(&entry.pieces[16 * b]), _mm512_loadu_si512(&pieces[16 * b]))) << (16 * b);
-#else
+#elif defined(USE_AVX2)
     for (int b = 0; b < 4; ++b) {
         const __m256i same = _mm256_cmpeq_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(&entry.pieces[8 * b])), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&pieces[8 * b])));
         changedSlots |= U64(~_mm256_movemask_ps(_mm256_castsi256_ps(same)) & 0xFF) << (8 * b);
     }
+#else
+    for (int i = 0; i < EvalList::MAX_LENGTH; ++i)
+        if (entry.pieces[i] != pieces[i])
+            changedSlots |= U64(1) << i;
 #endif
 
     while (changedSlots) {
@@ -988,6 +1070,37 @@ inline std::int32_t * Layer<OutputDimensions, InputDimensions>::propagate(std::u
     }
 #endif
 
+#if defined(USE_NEON)
+    constexpr std::uint32_t neonChunks = InputDimensions / 16;
+    if constexpr (OutputDimensions % 4 == 0 && InputDimensions >= 32) {
+        for (std::uint32_t i = 0; i < OutputDimensions; i += 4) {
+            int32x4_t sums[4] = {vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
+            const auto r0 = weights + (i + 0) * InputDimensions;
+            const auto r1 = weights + (i + 1) * InputDimensions;
+            const auto r2 = weights + (i + 2) * InputDimensions;
+            const auto r3 = weights + (i + 3) * InputDimensions;
+            for (std::uint32_t j = 0; j < neonChunks; ++j) {
+                const auto off = std::size_t(j) * 16; const uint8x16_t in = vld1q_u8(features + off);
+                sums[0] = affine_acc_neon(sums[0], in, vld1q_s8(r0 + off));
+                sums[1] = affine_acc_neon(sums[1], in, vld1q_s8(r1 + off));
+                sums[2] = affine_acc_neon(sums[2], in, vld1q_s8(r2 + off));
+                sums[3] = affine_acc_neon(sums[3], in, vld1q_s8(r3 + off));
+            }
+            output[i+0] = vaddvq_s32(sums[0]) + biases[i+0];
+            output[i+1] = vaddvq_s32(sums[1]) + biases[i+1];
+            output[i+2] = vaddvq_s32(sums[2]) + biases[i+2];
+            output[i+3] = vaddvq_s32(sums[3]) + biases[i+3];
+        }
+        return output;
+    }
+    for (std::uint32_t i = 0; i < OutputDimensions; ++i) {
+        int32x4_t sum = vdupq_n_s32(0); const auto row = weights + i * InputDimensions;
+        for (std::uint32_t j = 0; j < neonChunks; ++j) { const auto off = std::size_t(j) * 16; sum = affine_acc_neon(sum, vld1q_u8(features + off), vld1q_s8(row + off)); }
+        std::int32_t scalar = 0; for (std::uint32_t j = neonChunks * 16; j < InputDimensions; ++j) scalar += int(features[j]) * int(row[j]);
+        output[i] = vaddvq_s32(sum) + scalar + biases[i];
+    }
+    return output;
+#else // non-NEON backend
     for (std::uint32_t i = 0; i < OutputDimensions; ++i) {
         const std::uint32_t offset = i * InputDimensions;
 
@@ -1005,6 +1118,7 @@ inline std::int32_t * Layer<OutputDimensions, InputDimensions>::propagate(std::u
     }
 
     return output;
+#endif // USE_NEON
 }
 
 LayeredNetwork::LayeredNetwork(std::istream & s) : inputLayer(s), hiddenLayer1(s), hiddenLayer2(s) {
@@ -1046,9 +1160,24 @@ inline std::uint8_t* ClippedReLU<WeightScaleBits, InputDimensions>::propagate(st
         const __m256i words1 = _mm256_srai_epi16(_mm256_packs_epi32(_mm256_loadA_si256(&in[i * 4 + 2]), _mm256_loadA_si256(&in[i * 4 + 3])), WeightScaleBits);
         _mm256_storeA_si256(&out[i], _mm256_permutevar8x32_epi32(_mm256_max_epi8(_mm256_packs_epi16(words0, words1), zero), offsets));
     }
+#elif defined(USE_NEON)
+    for (std::uint32_t i = 0; i < InputDimensions; i += 16) {
+        const int32x4_t zero = vdupq_n_s32(0), maxv = vdupq_n_s32(127);
+        int32x4_t a = vminq_s32(vmaxq_s32(vshrq_n_s32(vld1q_s32(features+i), WeightScaleBits), zero), maxv);
+        int32x4_t b = vminq_s32(vmaxq_s32(vshrq_n_s32(vld1q_s32(features+i+4), WeightScaleBits), zero), maxv);
+        int32x4_t c = vminq_s32(vmaxq_s32(vshrq_n_s32(vld1q_s32(features+i+8), WeightScaleBits), zero), maxv);
+        int32x4_t d = vminq_s32(vmaxq_s32(vshrq_n_s32(vld1q_s32(features+i+12), WeightScaleBits), zero), maxv);
+        const int16x8_t ab = vcombine_s16(vmovn_s32(a), vmovn_s32(b)), cd = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+        vst1q_u8(output+i, vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(ab), vmovn_s16(cd))));
+    }
 #endif
 
-    std::uint32_t start = chunks * SIMD_WIDTH;
+    std::uint32_t start = 0;
+#if defined(USE_AVX2)
+    start = chunks * SIMD_WIDTH;
+#elif defined(USE_NEON)
+    start = InputDimensions;
+#endif
 
     for (std::uint32_t i = start; i < InputDimensions; ++i)
         output[i] = static_cast<std::uint8_t>(std::max(0, std::min(127, features[i] >> WeightScaleBits)));
@@ -1097,6 +1226,23 @@ inline std::uint8_t* ClippedReLU<WeightScaleBits, InputDimensions>::propagateSqr
             _mm256_extracti128_si256(packed8, 1));      // [v0[0..7], v1[0..7]] = 16 bytes
 
         _mm_storeu_si128(reinterpret_cast<__m128i*>(outBuffer), combined);
+        return output;
+    }
+#elif defined(USE_NEON)
+    if constexpr (InputDimensions == 16) {
+        const int32x4_t lo = vdupq_n_s32(-46340), hi = vdupq_n_s32(46340), maxv = vdupq_n_s32(127);
+        int16x8_t packed01, packed23;
+        int32x4_t v0 = vminq_s32(vmaxq_s32(vld1q_s32(features), lo), hi);
+        int32x4_t v1 = vminq_s32(vmaxq_s32(vld1q_s32(features + 4), lo), hi);
+        int32x4_t v2 = vminq_s32(vmaxq_s32(vld1q_s32(features + 8), lo), hi);
+        int32x4_t v3 = vminq_s32(vmaxq_s32(vld1q_s32(features + 12), lo), hi);
+        v0 = vminq_s32(vshrq_n_s32(vmulq_s32(v0, v0), 2 * WeightScaleBits + 7), maxv);
+        v1 = vminq_s32(vshrq_n_s32(vmulq_s32(v1, v1), 2 * WeightScaleBits + 7), maxv);
+        v2 = vminq_s32(vshrq_n_s32(vmulq_s32(v2, v2), 2 * WeightScaleBits + 7), maxv);
+        v3 = vminq_s32(vshrq_n_s32(vmulq_s32(v3, v3), 2 * WeightScaleBits + 7), maxv);
+        packed01 = vcombine_s16(vmovn_s32(v0), vmovn_s32(v1));
+        packed23 = vcombine_s16(vmovn_s32(v2), vmovn_s32(v3));
+        vst1q_u8(output, vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(packed01), vmovn_s16(packed23))));
         return output;
     }
 #endif

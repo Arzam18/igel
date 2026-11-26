@@ -32,7 +32,10 @@
 #include <iostream>
 #include <sstream>
 
-const std::string VERSION = "3.8.10";
+#ifndef IGEL_BUILD_DATE
+#define IGEL_BUILD_DATE ""
+#endif
+const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;
 #if defined(PURE_HCE)
 const std::string PROGRAM_NAME = "Igel HCE";
 #else
@@ -40,12 +43,17 @@ const std::string PROGRAM_NAME = "Igel";
 #endif
 const std::string ARCHITECTURE = " 64 "
 
+#if defined(USE_NEON)
+"ARM64 NEON"
+#if defined(USE_DOTPROD)
+" DOTPROD"
+#endif
+#else
 #if _BTYPE==0
 "POPCNT "
 #else
 "BMI2 "
 #endif
-
 #if defined(USE_AVX512)
 "AVX512"
 #if defined(USE_VNNI)
@@ -55,6 +63,7 @@ const std::string ARCHITECTURE = " 64 "
 "AVX2"
 #if defined(USE_AVXVNNI)
 " VNNI256"
+#endif
 #endif
 #endif
 ;
