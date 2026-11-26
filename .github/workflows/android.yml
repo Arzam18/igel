@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       network_url:
-        description: "Igel 3.8.10 compatible NNUE network URL"
+        description: "Igel NNUE network download URL"
         required: true
         type: string
         default: "https://github.com/vshcherbyna/igel/releases/download/0.8/820573bc.universal"
@@ -15,24 +15,29 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.variant }}
-    runs-on: ubuntu-24.04
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         include:
-          - variant: NEON
+          - name: NEON
             march: armv8-a+simd
             dotprod: OFF
             artifact: igel-3.8.10-android-arm64-neon
-          - variant: NEON-Dotprod
+
+          - name: NEON-Dotprod
             march: armv8.2-a+dotprod
             dotprod: ON
             artifact: igel-3.8.10-android-arm64-dotprod
 
     steps:
-      - name: Checkout
+      - name: Checkout Igel source
         uses: actions/checkout@v4
+        with:
+          repository: Arzam18/igel
+          ref: master
 
       - name: Install Ninja
         run: |
@@ -40,32 +45,46 @@ jobs:
           sudo apt-get install -y ninja-build
 
       - name: Install Android NDK r27c (pinned and checksum-verified)
+        shell: bash
         run: |
           set -euo pipefail
+
           ZIP="$RUNNER_TEMP/android-ndk-r27c-linux.zip"
+
           curl --fail --location --retry 3 \
             https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
             --output "$ZIP"
+
           echo "090e8083a715fdb1a3e402d0763c388abb03fb4e  $ZIP" | sha1sum --check --status
+
           unzip -q "$ZIP" -d "$RUNNER_TEMP"
+
           test -x "$RUNNER_TEMP/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
           echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r27c" >> "$GITHUB_ENV"
+
           cmake --version
           ninja --version
 
       - name: Download Igel 3.8.10 network
+        shell: bash
         env:
           NETWORK_URL: ${{ inputs.network_url }}
         run: |
           set -euo pipefail
+
           curl --fail --location --retry 3 "$NETWORK_URL" --output network_file
+
           test -s network_file
           sha256sum network_file | tee network_file.sha256
 
       - name: Configure Android ARM64
+        shell: bash
         run: |
           set -euo pipefail
-          VARIANT_DIR="build-${{ matrix.variant }}"
+
+          VARIANT_DIR="build-${{ matrix.name }}"
+
           cmake -S . -B "$VARIANT_DIR" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
@@ -78,46 +97,88 @@ jobs:
             -DCMAKE_C_FLAGS="-march=${{ matrix.march }}" \
             -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76" \
             -DCMAKE_VERBOSE_MAKEFILE=ON
-          grep -E 'CMAKE_CXX_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:STRING|ANDROID_ABI|ANDROID_PLATFORM' "$VARIANT_DIR/CMakeCache.txt" || true
+
+          grep -E 'CMAKE_CXX_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:STRING|ANDROID_ABI|ANDROID_PLATFORM' \
+            "$VARIANT_DIR/CMakeCache.txt" || true
 
       - name: Build engine
+        shell: bash
         run: |
           set -euo pipefail
-          cmake --build "build-${{ matrix.variant }}" --target igel --parallel "$(nproc)" --verbose 2>&1 | tee "build-${{ matrix.variant }}.log"
+
+          cmake --build "build-${{ matrix.name }}" \
+            --target igel \
+            --parallel "$(nproc)" \
+            --verbose 2>&1 | tee "build-${{ matrix.name }}.log"
 
       - name: Verify Android ARM64 binary and ISA
+        shell: bash
         run: |
           set -euo pipefail
-          BIN="build-${{ matrix.variant }}/igel"
+
+          VARIANT_DIR="build-${{ matrix.name }}"
+          BIN="$VARIANT_DIR/igel"
+
           test -s "$BIN"
           file "$BIN"
+
           readelf -h "$BIN" | grep -q 'Class:.*ELF64'
           readelf -h "$BIN" | grep -q 'Machine:.*AArch64'
+
           if readelf -d "$BIN" | grep -q 'libc++_shared.so'; then
             echo "::error::Unexpected shared libc++ dependency"
             exit 1
           fi
-          strings "$BIN" | grep -Fq "3.8.10"
-          strings "$BIN" | grep -Fq "ARM64 NEON"
-          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump" -d "$BIN" > "$BIN.disasm"
+
+          # Extract strings completely before searching.
+          # Avoids SIGPIPE with set -o pipefail.
+          STRINGS_FILE="$RUNNER_TEMP/igel-strings.txt"
+          strings "$BIN" > "$STRINGS_FILE"
+
+          grep -Fq "3.8.10" "$STRINGS_FILE" || {
+            echo "::error::Igel version marker 3.8.10 not found"
+            exit 1
+          }
+
+          grep -Fq "ARM64 NEON" "$STRINGS_FILE" || {
+            echo "::error::ARM64 NEON marker not found"
+            exit 1
+          }
+
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump" \
+            -d "$BIN" > "$BIN.disasm"
+
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            grep -Eiq '\bsdot\b' "$BIN.disasm" || { echo "::error::SDOT instruction not found"; exit 1; }
+            grep -Eiq '\bsdot\b' "$BIN.disasm" || {
+              echo "::error::SDOT instruction not found"
+              exit 1
+            }
           else
-            grep -Eiq '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*\b' "$BIN.disasm" || { echo "::error::Expected NEON arithmetic not found"; exit 1; }
+            grep -Eiq '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*\b' "$BIN.disasm" || {
+              echo "::error::Expected NEON arithmetic not found"
+              exit 1
+            }
+
             if grep -Eiq '\bsdot\b' "$BIN.disasm"; then
               echo "::error::Baseline NEON binary unexpectedly contains SDOT"
               exit 1
             fi
           fi
+
           mkdir -p artifact
+
           cp "$BIN" "artifact/${{ matrix.artifact }}"
           chmod +x "artifact/${{ matrix.artifact }}"
-          sha256sum "artifact/${{ matrix.artifact }}" > "artifact/${{ matrix.artifact }}.sha256"
+
+          sha256sum "artifact/${{ matrix.artifact }}" \
+            > "artifact/${{ matrix.artifact }}.sha256"
+
           cp network_file.sha256 artifact/
 
-      - name: Upload engine-only artifact
+      - name: Upload Android ARM64 engine
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: artifact/*
           if-no-files-found: error
+          retention-days: 30
