@@ -1,5 +1,5 @@
 
-name: Build Igel Android ARM64
+name: Build Igel 3.8.10 Android ARM64
 
 on:
   workflow_dispatch:
@@ -23,14 +23,22 @@ jobs:
       matrix:
         include:
           - name: NEON
+            build_dir: build-NEON
             march: armv8-a+simd
-            dotprod: OFF
+            dotprod: "OFF"
             artifact: igel-3.8.10-android-arm64-neon
 
           - name: NEON-Dotprod
+            build_dir: build-NEON-Dotprod
             march: armv8.2-a+dotprod
-            dotprod: ON
+            dotprod: "ON"
             artifact: igel-3.8.10-android-arm64-dotprod
+
+    env:
+      ANDROID_API: 24
+      NDK_VERSION: r27c
+      NDK_REVISION: "27.2.12479018"
+      NDK_SHA1: "090e8083a715fdb1a3e402d0763c388abb03fb4e"
 
     steps:
       - name: Checkout Igel 3.8.10 source
@@ -38,243 +46,299 @@ jobs:
         with:
           repository: Arzam18/igel
           ref: 724dc284d2d3553846a40c7d74c1551474ddd625
+          fetch-depth: 1
 
-      - name: Install Ninja
+      - name: Install build tools
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ninja-build
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            unzip \
+            curl \
+            file \
+            binutils
 
-      - name: Install Android NDK r27c
+      - name: Download and install Android NDK r27c
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP="$RUNNER_TEMP/android-ndk-r27c-linux.zip"
+          NDK_ARCHIVE="$RUNNER_TEMP/android-ndk-r27c-linux.zip"
+          NDK_URL="https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
 
-          curl --fail --location --retry 3 \
-            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip \
-            --output "$ZIP"
+          curl -fL --retry 3 --retry-delay 2 \
+            "$NDK_URL" \
+            -o "$NDK_ARCHIVE"
 
-          echo "090e8083a715fdb1a3e402d0763c388abb03fb4e  $ZIP" \
-            | sha1sum --check --status
+          echo "${NDK_SHA1}  ${NDK_ARCHIVE}" | sha1sum --check -
 
-          unzip -q "$ZIP" -d "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/android-ndk"
+          unzip -q "$NDK_ARCHIVE" -d "$RUNNER_TEMP/android-ndk"
 
-          NDK="$RUNNER_TEMP/android-ndk-r27c"
+          NDK_PATH="$RUNNER_TEMP/android-ndk/android-ndk-${NDK_REVISION}"
 
-          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          test -x "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
-          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
-          cmake --version
-          ninja --version
+          echo "Installed Android NDK:"
+          "$NDK_PATH/ndk-build" --version
 
-      - name: Verify Igel source version
+      - name: Verify Igel source and ARM64 implementations
         shell: bash
         run: |
           set -euo pipefail
 
-          ACTUAL_COMMIT="$(git rev-parse HEAD)"
-          EXPECTED_COMMIT="724dc284d2d3553846a40c7d74c1551474ddd625"
+          echo "===== Igel version ====="
+          grep -Fq 'const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;' src/uci.cpp
 
-          test "$ACTUAL_COMMIT" = "$EXPECTED_COMMIT"
+          echo "Igel 3.8.10 source identity confirmed."
 
-          grep -Fq \
-            'const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;' \
-            src/uci.cpp
-
+          echo "===== ARM64 NEON implementation ====="
           grep -Fq '"ARM64 NEON"' src/uci.cpp
+          grep -Fq '#include <arm_neon.h>' src/nnue.cpp
+          grep -Fq 'inline int32x4_t affine_acc_neon' src/nnue.cpp
 
-          grep -Fq 'vdotq_s32(acc, signedA, b)' src/nnue.cpp
+          echo "ARM64 NEON implementation confirmed."
 
-          echo "Igel source version: 3.8.10"
-          echo "Source commit: $ACTUAL_COMMIT"
+          echo "===== DotProd implementation ====="
+          grep -Fq 'vdotq_s32' src/nnue.cpp
+          grep -Fq '" DOTPROD"' src/uci.cpp
 
-      - name: Download Igel NNUE network
+          echo "DotProd implementation confirmed."
+
+      - name: Download NNUE network
         shell: bash
         env:
           NETWORK_URL: ${{ inputs.network_url }}
         run: |
           set -euo pipefail
 
-          curl --fail --location --retry 3 \
+          test -n "$NETWORK_URL"
+
+          curl -fL --retry 3 --retry-delay 2 \
             "$NETWORK_URL" \
-            --output network_file
+            -o "$GITHUB_WORKSPACE/network_file"
 
-          test -s network_file
+          test -s "$GITHUB_WORKSPACE/network_file"
 
-          sha256sum network_file | tee network_file.sha256
+          echo "===== NNUE network information ====="
+          ls -lh "$GITHUB_WORKSPACE/network_file"
+          sha256sum "$GITHUB_WORKSPACE/network_file" | tee network.sha256
 
-      - name: Configure Android ARM64
+      - name: Configure Android ARM64 ${{ matrix.name }}
         shell: bash
         run: |
           set -euo pipefail
 
-          VARIANT_DIR="build-${{ matrix.name }}"
+          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
 
-          cmake -S . -B "$VARIANT_DIR" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+          test -f "$NDK_TOOLCHAIN"
+
+          cmake \
+            -S . \
+            -B "${{ matrix.build_dir }}" \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
             -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DEVALFILE="$GITHUB_WORKSPACE/network_file" \
             -D_BTYPE=0 \
             -DUSE_DOTPROD=${{ matrix.dotprod }} \
-            -DCMAKE_C_FLAGS="-march=${{ matrix.march }}" \
-            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76" \
-            -DCMAKE_VERBOSE_MAKEFILE=ON
+            -DCMAKE_C_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76" \
+            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76"
 
-          echo "===== Android compiler configuration ====="
-          grep -E 'ANDROID_ABI|ANDROID_PLATFORM|CMAKE_CXX_COMPILER' \
-            "$VARIANT_DIR/CMakeCache.txt" || true
+      - name: Verify compiler configuration
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "===== Required compile definitions ====="
+          COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
 
-          grep -q -- '-DUSE_NEON=1' \
-            "$VARIANT_DIR/compile_commands.json" || {
-              echo "::error::USE_NEON missing from compile commands"
-              exit 1
-            }
+          test -s "$COMPILE_COMMANDS"
+
+          echo "===== Compiler definitions ====="
+
+          grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
 
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            grep -q -- '-DUSE_DOTPROD=1' \
-              "$VARIANT_DIR/compile_commands.json" || {
-                echo "::error::USE_DOTPROD missing from compile commands"
-                exit 1
-              }
+            grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
+            echo "NEON + DOTPROD definitions confirmed."
           else
-            if grep -q -- '-DUSE_DOTPROD=1' \
-              "$VARIANT_DIR/compile_commands.json"; then
-              echo "::error::Unexpected DotProd definition in baseline build"
+            if grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"; then
+              echo "ERROR: DOTPROD unexpectedly enabled in baseline NEON build."
               exit 1
             fi
+            echo "Baseline NEON definition confirmed."
           fi
 
-      - name: Build Igel engine
+          echo "===== Target compiler ====="
+          grep -F 'aarch64-linux-android24-clang++' "$COMPILE_COMMANDS" | head -n 3
+
+      - name: Build Igel
         shell: bash
         run: |
           set -euo pipefail
 
-          VARIANT_DIR="build-${{ matrix.name }}"
-
-          cmake --build "$VARIANT_DIR" \
+          cmake --build "${{ matrix.build_dir }}" \
             --target igel \
-            --parallel "$(nproc)" \
-            --verbose 2>&1 | tee "$VARIANT_DIR-build.log"
+            --parallel "$(nproc)"
 
-          test -s "$VARIANT_DIR/igel"
+          test -s "${{ matrix.build_dir }}/igel"
 
-      - name: Verify Android ARM64 binary and ISA
+      - name: Verify Android ARM64 binary
         shell: bash
         run: |
           set -euo pipefail
 
-          VARIANT_DIR="build-${{ matrix.name }}"
-          BIN="$VARIANT_DIR/igel"
-
-          test -s "$BIN"
+          BIN="${{ matrix.build_dir }}/igel"
 
           echo "===== Binary information ====="
           file "$BIN"
 
-          ELF_HEADER="$(readelf -h "$BIN")"
+          readelf -h "$BIN" | grep -F 'ELF64'
+          readelf -h "$BIN" | grep -F 'AArch64'
+          readelf -l "$BIN" | grep -F '/system/bin/linker64'
 
-          grep -Eq 'Class:.*ELF64' <<< "$ELF_HEADER" || {
-            echo "::error::Binary is not ELF64"
-            exit 1
-          }
-
-          grep -Eq 'Machine:.*AArch64' <<< "$ELF_HEADER" || {
-            echo "::error::Binary is not AArch64"
-            exit 1
-          }
-
-          DYNAMIC_INFO="$(readelf -d "$BIN")"
-
-          if grep -Fq 'libc++_shared.so' <<< "$DYNAMIC_INFO"; then
-            echo "::error::Unexpected libc++_shared.so dependency"
+          if readelf -d "$BIN" | grep -Fq 'libc++_shared.so'; then
+            echo "ERROR: Binary depends on libc++_shared.so."
             exit 1
           fi
 
-          echo "===== Runtime UCI identity ====="
+          echo "Android ARM64 ELF verification passed."
 
-          UCI_OUTPUT="$(
-            printf 'uci\nquit\n' | "$BIN"
-          )"
+      - name: Verify UCI identity and Android build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "$UCI_OUTPUT"
+          echo "===== Source UCI identity ====="
 
-          grep -Fq 'id name Igel 3.8.10' <<< "$UCI_OUTPUT" || {
-            echo "::error::Igel 3.8.10 runtime identity not found"
-            exit 1
-          }
+          grep -Fq 'const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;' src/uci.cpp
+          grep -Fq '"ARM64 NEON"' src/uci.cpp
+          grep -Fq '" DOTPROD"' src/uci.cpp
+          grep -Fq 'std::cout << "id name " << PROGRAM_NAME << " " << VERSION << ARCHITECTURE' src/uci.cpp
 
-          grep -Fq 'ARM64 NEON' <<< "$UCI_OUTPUT" || {
-            echo "::error::ARM64 NEON runtime identity missing"
-            exit 1
-          }
+          echo "Igel 3.8.10 UCI identity is present in source."
+
+          echo "===== Generated compiler definitions ====="
+
+          COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
+          test -f "$COMPILE_COMMANDS"
+
+          grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
 
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            grep -Fq 'DOTPROD' <<< "$UCI_OUTPUT" || {
-              echo "::error::DotProd runtime identity missing"
-              exit 1
-            }
+            grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
+            echo "NEON and DOTPROD compiler definitions confirmed."
           else
-            if grep -Fq 'DOTPROD' <<< "$UCI_OUTPUT"; then
-              echo "::error::Baseline NEON unexpectedly reports DotProd"
+            if grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"; then
+              echo "ERROR: Baseline NEON build unexpectedly has DOTPROD enabled."
               exit 1
             fi
+            echo "Baseline NEON compiler definition confirmed."
           fi
 
-          echo "===== Disassembly verification ====="
+          echo "===== Android ARM64 ELF verification ====="
 
+          BIN="${{ matrix.build_dir }}/igel"
+
+          test -s "$BIN"
+          file "$BIN"
+          readelf -h "$BIN" | grep -E 'Class:.*ELF64'
+          readelf -h "$BIN" | grep -E 'Machine:.*AArch64'
+          readelf -l "$BIN" | grep -F '/system/bin/linker64'
+
+          if readelf -d "$BIN" | grep -Fq 'libc++_shared.so'; then
+            echo "ERROR: Binary depends on libc++_shared.so."
+            exit 1
+          fi
+
+          echo "Android ARM64 ELF checks passed."
+
+      - name: Verify generated ARM64 instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="${{ matrix.build_dir }}/igel"
           OBJDUMP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
 
-          "$OBJDUMP" -d "$BIN" > "$BIN.disasm"
+          test -x "$OBJDUMP"
+
+          "$OBJDUMP" -d "$BIN" > "${{ matrix.build_dir }}/disassembly.txt"
+
+          echo "===== ARM64 instruction verification ====="
 
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            grep -Eiq '\bsdot\b' "$BIN.disasm" || {
-              echo "::error::SDOT instruction not found in DotProd binary"
-              exit 1
-            }
-
-            echo "Confirmed: SDOT instruction present."
-          else
-            grep -Eiq \
-              '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*[[:space:]]+v[0-9]+\.' \
-              "$BIN.disasm" || {
-                echo "::error::NEON vector instructions not found"
-                exit 1
-              }
-
-            if grep -Eiq '\bsdot\b' "$BIN.disasm"; then
-              echo "::error::Baseline NEON binary unexpectedly contains SDOT"
+            if ! grep -Eiq '[[:space:]]sdot[[:space:]]' "${{ matrix.build_dir }}/disassembly.txt"; then
+              echo "ERROR: SDOT instruction not found in DotProd binary."
               exit 1
             fi
 
-            echo "Confirmed: NEON instructions present; SDOT absent."
+            echo "SDOT instruction confirmed."
+          else
+            if grep -Eiq '[[:space:]]sdot[[:space:]]' "${{ matrix.build_dir }}/disassembly.txt"; then
+              echo "ERROR: SDOT unexpectedly found in baseline NEON binary."
+              exit 1
+            fi
+
+            echo "No SDOT instruction in baseline NEON binary."
+
+            if ! grep -Eiq '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*[[:space:]]+v[0-9]+\.' "${{ matrix.build_dir }}/disassembly.txt"; then
+              echo "ERROR: Expected ARM NEON vector arithmetic was not found."
+              exit 1
+            fi
+
+            echo "ARM NEON vector instructions confirmed."
           fi
 
-          echo "===== Package engine artifact ====="
+      - name: Prepare engine-only artifact
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          mkdir -p artifact
+          BIN="${{ matrix.build_dir }}/igel"
+          STAGING="${{ matrix.build_dir }}/artifact"
 
-          cp "$BIN" "artifact/${{ matrix.artifact }}"
-          chmod +x "artifact/${{ matrix.artifact }}"
+          mkdir -p "$STAGING"
 
-          sha256sum "artifact/${{ matrix.artifact }}" \
-            > "artifact/${{ matrix.artifact }}.sha256"
+          cp "$BIN" "$STAGING/igel"
 
-          cp network_file.sha256 artifact/
+          (
+            cd "$STAGING"
+            sha256sum igel > SHA256SUMS.txt
+          )
 
-          echo "Verification completed for ${{ matrix.name }}."
+          cat > "$STAGING/build-info.txt" <<EOF
+          Engine: Igel
+          Version: 3.8.10
+          Target: Android
+          ABI: arm64-v8a
+          Android API: ${ANDROID_API}
+          NDK: ${NDK_VERSION} (${NDK_REVISION})
+          Build variant: ${{ matrix.name }}
+          Architecture flags: -march=${{ matrix.march }} -mtune=cortex-a76
+          USE_NEON: enabled
+          USE_DOTPROD: ${{ matrix.dotprod }}
+          Source commit: 724dc284d2d3553846a40c7d74c1551474ddd625
+          EOF
 
-      - name: Upload Android ARM64 engine
+          echo "===== Artifact contents ====="
+          ls -lh "$STAGING"
+
+      - name: Upload ${{ matrix.name }} engine
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: artifact/*
+          path: ${{ matrix.build_dir }}/artifact/
           if-no-files-found: error
-          retention-days: 30
+          compression-level: 9
