@@ -52,6 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
             cmake \
@@ -78,22 +79,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/android-ndk"
           unzip -q "$NDK_ARCHIVE" -d "$RUNNER_TEMP/android-ndk"
 
-          # The archive extracts to android-ndk-r27c.
           NDK_PATH="$RUNNER_TEMP/android-ndk/android-ndk-r27c"
 
-          NDK_COMPILER="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          NDK_BIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK_COMPILER="$NDK_BIN/aarch64-linux-android24-clang++"
 
           if [[ ! -x "$NDK_COMPILER" ]]; then
-            echo "ERROR: Android NDK compiler not found."
+            echo "ERROR: Android API 24 target compiler not found."
             echo "Expected: $NDK_COMPILER"
-            echo "Extracted directories:"
-            find "$RUNNER_TEMP/android-ndk" -maxdepth 3 -type d
+            find "$RUNNER_TEMP/android-ndk" -maxdepth 4 -type f -name 'clang++'
             exit 1
           fi
 
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK_PATH" >> "$GITHUB_ENV"
-          echo "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
 
           echo "Android NDK r27c installed successfully."
           "$NDK_PATH/ndk-build" --version
@@ -104,18 +104,24 @@ jobs:
           set -euo pipefail
 
           echo "===== Igel version ====="
+
           grep -Fq 'const std::string VERSION = "3.8.10" IGEL_BUILD_DATE;' src/uci.cpp
+
           echo "Igel 3.8.10 source identity confirmed."
 
           echo "===== ARM64 NEON implementation ====="
+
           grep -Fq '"ARM64 NEON"' src/uci.cpp
           grep -Fq '#include <arm_neon.h>' src/nnue.cpp
           grep -Fq 'inline int32x4_t affine_acc_neon' src/nnue.cpp
+
           echo "ARM64 NEON implementation confirmed."
 
           echo "===== DotProd implementation ====="
+
           grep -Fq 'vdotq_s32' src/nnue.cpp
           grep -Fq '" DOTPROD"' src/uci.cpp
+
           echo "DotProd implementation confirmed."
 
       - name: Download NNUE network
@@ -134,6 +140,7 @@ jobs:
           test -s "$GITHUB_WORKSPACE/network_file"
 
           echo "===== NNUE network information ====="
+
           ls -lh "$GITHUB_WORKSPACE/network_file"
           sha256sum "$GITHUB_WORKSPACE/network_file" | tee network.sha256
 
@@ -143,6 +150,7 @@ jobs:
           set -euo pipefail
 
           NDK_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+
           test -f "$NDK_TOOLCHAIN"
 
           cmake \
@@ -166,26 +174,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
-          test -s "$COMPILE_COMMANDS"
+          BUILD_DIR="${{ matrix.build_dir }}"
+          COMPILE_COMMANDS="$BUILD_DIR/compile_commands.json"
+          CMAKE_CACHE="$BUILD_DIR/CMakeCache.txt"
 
-          echo "===== Compiler definitions ====="
+          test -s "$COMPILE_COMMANDS"
+          test -s "$CMAKE_CACHE"
+
+          echo "===== NDK C++ compiler ====="
+
+          NDK_CLANGXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          test -x "$NDK_CLANGXX"
+
+          if ! grep -Fq "$NDK_CLANGXX" "$CMAKE_CACHE"; then
+            echo "ERROR: CMake is not configured with the expected NDK clang++."
+            grep -E 'CMAKE_CXX_COMPILER:|CMAKE_C_COMPILER:' "$CMAKE_CACHE" || true
+            exit 1
+          fi
+
+          echo "NDK clang++ compiler confirmed:"
+          echo "$NDK_CLANGXX"
+
+          echo "===== NEON compiler definition ====="
 
           grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
 
+          echo "USE_NEON=1 confirmed."
+
+          echo "===== DotProd compiler definition ====="
+
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
             grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
-            echo "NEON + DOTPROD definitions confirmed."
+            echo "USE_DOTPROD=1 confirmed."
           else
             if grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"; then
               echo "ERROR: DOTPROD unexpectedly enabled in baseline NEON build."
               exit 1
             fi
-            echo "Baseline NEON definition confirmed."
+
+            echo "Baseline NEON correctly excludes USE_DOTPROD."
           fi
 
-          echo "===== Target compiler ====="
-          grep -F 'aarch64-linux-android24-clang++' "$COMPILE_COMMANDS" | head -n 3
+          echo "===== Architecture compiler flags ====="
+
+          grep -Fq -- "-march=${{ matrix.march }}" "$COMPILE_COMMANDS"
+          grep -Fq -- "-mtune=cortex-a76" "$COMPILE_COMMANDS"
+
+          echo "Architecture flags confirmed:"
+          echo "-march=${{ matrix.march }}"
+          echo "-mtune=cortex-a76"
 
       - name: Build Igel
         shell: bash
@@ -206,6 +244,7 @@ jobs:
           BIN="${{ matrix.build_dir }}/igel"
 
           echo "===== Binary information ====="
+
           file "$BIN"
 
           readelf -h "$BIN" | grep -F 'ELF64'
@@ -233,21 +272,21 @@ jobs:
 
           echo "Igel 3.8.10 UCI identity is present in source."
 
-          echo "===== Generated compiler definitions ====="
+          echo "===== Compiler definitions ====="
 
           COMPILE_COMMANDS="${{ matrix.build_dir }}/compile_commands.json"
-          test -f "$COMPILE_COMMANDS"
 
           grep -Fq -- '-DUSE_NEON=1' "$COMPILE_COMMANDS"
 
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
             grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"
-            echo "NEON and DOTPROD compiler definitions confirmed."
+            echo "NEON and DOTPROD definitions confirmed."
           else
             if grep -Fq -- '-DUSE_DOTPROD=1' "$COMPILE_COMMANDS"; then
               echo "ERROR: Baseline NEON build unexpectedly has DOTPROD enabled."
               exit 1
             fi
+
             echo "Baseline NEON compiler definition confirmed."
           fi
 
@@ -257,6 +296,7 @@ jobs:
 
           test -s "$BIN"
           file "$BIN"
+
           readelf -h "$BIN" | grep -E 'Class:.*ELF64'
           readelf -h "$BIN" | grep -E 'Machine:.*AArch64'
           readelf -l "$BIN" | grep -F '/system/bin/linker64'
@@ -266,7 +306,7 @@ jobs:
             exit 1
           fi
 
-          echo "Android ARM64 ELF checks passed."
+          echo "Android ARM64 checks passed."
 
       - name: Verify generated ARM64 instructions
         shell: bash
@@ -275,29 +315,30 @@ jobs:
 
           BIN="${{ matrix.build_dir }}/igel"
           OBJDUMP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+          DISASSEMBLY="${{ matrix.build_dir }}/disassembly.txt"
 
           test -x "$OBJDUMP"
 
-          "$OBJDUMP" -d "$BIN" > "${{ matrix.build_dir }}/disassembly.txt"
+          "$OBJDUMP" -d "$BIN" > "$DISASSEMBLY"
 
           echo "===== ARM64 instruction verification ====="
 
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
-            if ! grep -Eiq '[[:space:]]sdot[[:space:]]' "${{ matrix.build_dir }}/disassembly.txt"; then
+            if ! grep -Eiq '[[:space:]]sdot[[:space:]]' "$DISASSEMBLY"; then
               echo "ERROR: SDOT instruction not found in DotProd binary."
               exit 1
             fi
 
             echo "SDOT instruction confirmed."
           else
-            if grep -Eiq '[[:space:]]sdot[[:space:]]' "${{ matrix.build_dir }}/disassembly.txt"; then
+            if grep -Eiq '[[:space:]]sdot[[:space:]]' "$DISASSEMBLY"; then
               echo "ERROR: SDOT unexpectedly found in baseline NEON binary."
               exit 1
             fi
 
             echo "No SDOT instruction in baseline NEON binary."
 
-            if ! grep -Eiq '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*[[:space:]]+v[0-9]+\.' "${{ matrix.build_dir }}/disassembly.txt"; then
+            if ! grep -Eiq '\b(add|sub|smax|smin|smull|smlal|sqadd|sqsub)[[:alnum:]]*[[:space:]]+v[0-9]+\.' "$DISASSEMBLY"; then
               echo "ERROR: Expected ARM NEON vector arithmetic was not found."
               exit 1
             fi
@@ -314,7 +355,9 @@ jobs:
           STAGING="${{ matrix.build_dir }}/artifact"
 
           mkdir -p "$STAGING"
+
           cp "$BIN" "$STAGING/igel"
+          cp network.sha256 "$STAGING/nnue-network.sha256"
 
           (
             cd "$STAGING"
