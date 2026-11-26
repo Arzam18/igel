@@ -1,13 +1,9 @@
+
 name: Build Igel Android ARM64
 
 on:
   workflow_dispatch:
     inputs:
-      uci_date:
-        description: "UCI build identity date (YYYYMMDD)"
-        required: true
-        type: string
-        default: "20261126"
       network_url:
         description: "Igel 3.8.10 compatible NNUE network URL"
         required: true
@@ -57,23 +53,16 @@ jobs:
           cmake --version
           ninja --version
 
-      - name: Validate inputs and download Igel 3.8.10 network
+      - name: Download Igel 3.8.10 network
         env:
-          UCI_DATE: ${{ inputs.uci_date }}
           NETWORK_URL: ${{ inputs.network_url }}
         run: |
           set -euo pipefail
-          if ! [[ "$UCI_DATE" =~ ^[0-9]{8}$ ]]; then
-            echo "::error::uci_date must use YYYYMMDD format"
-            exit 1
-          fi
           curl --fail --location --retry 3 "$NETWORK_URL" --output network_file
           test -s network_file
           sha256sum network_file | tee network_file.sha256
 
       - name: Configure Android ARM64
-        env:
-          BUILD_DATE: ${{ inputs.uci_date }}
         run: |
           set -euo pipefail
           VARIANT_DIR="build-${{ matrix.variant }}"
@@ -87,7 +76,7 @@ jobs:
             -D_BTYPE=0 \
             -DUSE_DOTPROD=${{ matrix.dotprod }} \
             -DCMAKE_C_FLAGS="-march=${{ matrix.march }}" \
-            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76 -DIGEL_BUILD_DATE=\"-${BUILD_DATE}\"" \
+            -DCMAKE_CXX_FLAGS="-march=${{ matrix.march }} -mtune=cortex-a76" \
             -DCMAKE_VERBOSE_MAKEFILE=ON
           grep -E 'CMAKE_CXX_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:STRING|ANDROID_ABI|ANDROID_PLATFORM' "$VARIANT_DIR/CMakeCache.txt" || true
 
@@ -108,7 +97,7 @@ jobs:
             echo "::error::Unexpected shared libc++ dependency"
             exit 1
           fi
-          strings "$BIN" | grep -Fq "3.8.10-${{ inputs.uci_date }}"
+          strings "$BIN" | grep -Fq "3.8.10"
           strings "$BIN" | grep -Fq "ARM64 NEON"
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump" -d "$BIN" > "$BIN.disasm"
           if [[ "${{ matrix.dotprod }}" == "ON" ]]; then
